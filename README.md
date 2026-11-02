@@ -12,6 +12,18 @@ Early development. Features, installation and configuration instructions will be
 
 To be added.
 
+## Development
+
+Requires Node.js 22 or 24 and the [Forge CLI](https://developer.atlassian.com/platform/forge/getting-started/).
+
+```sh
+npm install
+npm test           # Vitest unit tests
+npm run build      # typecheck + build the Custom UI views into static/<view>/build
+npm run lint       # forge lint (needs a registered app id in manifest.yml)
+npm run deploy     # build the UI and forge deploy
+```
+
 ## Privacy and terms
 
 - [Privacy Policy](docs/PRIVACY.md)
