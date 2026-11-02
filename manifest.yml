@@ -1,0 +1,321 @@
+app:
+  id: ari:cloud:ecosystem::app/288617c9-b888-4d17-af01-241b9acfe722
+  runtime:
+    name: nodejs24.x
+  compatibility:
+    jira:
+      required: true
+    confluence:
+      required: false
+
+modules:
+  # --- Jira / JSM ---
+  jira:issuePanel:
+    - key: hindsight-incident
+      title: Hindsight
+      icon: resource:icons;hindsight.svg
+      resource: incident-ui
+      resolver:
+        function: ui-resolver
+  jira:globalPage:
+    - key: hindsight-insights
+      title: Hindsight Insights
+      resource: insights-ui
+      resolver:
+        function: ui-resolver
+  jira:adminPage:
+    - key: hindsight-setup
+      title: Hindsight setup
+      resource: setup-ui
+      resolver:
+        function: ui-resolver
+
+  # --- Events (Sentinel) and lifecycle ---
+  trigger:
+    - key: work-event-trigger
+      function: on-work-event
+      events:
+        - avi:jira:created:issue
+        - avi:jira:commented:issue
+        - avi:confluence:created:page
+        - avi:confluence:updated:page
+        - avi:confluence:created:comment
+    # New install / major upgrade: start the schema migration (paced for the Forge SQL DDL rate limit).
+    - key: on-app-lifecycle
+      function: app-lifecycle
+      events:
+        - avi:forge:installed:app
+        - avi:forge:upgraded:app
+
+  # --- Background ---
+  consumer:
+    - key: collect-consumer
+      queue: collect
+      function: collect-events
+    - key: score-consumer
+      queue: score
+      function: score-candidates
+    - key: reach-consumer
+      queue: reach
+      function: trace-reach
+    - key: propose-consumer
+      queue: propose
+      function: propose-routes-job
+    - key: sentinel-consumer
+      queue: sentinel
+      function: check-sentinel
+    - key: migrate-consumer
+      queue: schema-migrate
+      function: migrate-schema
+    - key: demo-consumer
+      queue: demo-seed
+      function: demo-job
+  scheduledTrigger:
+    - key: daily-retention
+      function: purge-expired
+      interval: day
+
+  # --- Rovo ---
+  rovo:agent:
+    - key: hindsight-investigator
+      name: Hindsight Investigator
+      description: Looks back at a past incident, finds the early signals that already
+        pointed to it, shows where they stopped and proposes routes so they
+        reach the right team next time.
+      prompt: resource:agent-prompt;prompt.md
+      conversationStarters:
+        - Did we have early signals before this incident?
+        - Where did those signals get stuck?
+        - Which route would have warned us earliest?
+      actions:
+        - find-prior-signals
+        - confirm-signal
+        - trace-signal-reach
+        - propose-routes
+        - create-route
+        - write-pir-section
+      skills:
+        - early-signal-investigation
+  rovo:skill:
+    - key: early-signal-investigation
+      source:
+        dir: skills/early-signal-investigation
+      dependencies:
+        tools:
+          - find-prior-signals
+          - confirm-signal
+          - trace-signal-reach
+          - propose-routes
+          - create-route
+          - write-pir-section
+  action:
+    - key: find-prior-signals
+      name: Find prior signals
+      function: find-prior-signals-fn
+      actionVerb: GET
+      description: Find confirmed or candidate early signals for an incident, with
+        exact quote, link and days before the incident. Only artefacts the user
+        can view.
+      inputs:
+        incidentKey:
+          title: Incident key
+          type: string
+          required: true
+          description: JSM incident issue key, for example INC-1.
+        windowDays:
+          title: Window (days)
+          type: string
+          required: false
+          description: Days before the incident to search (default 30).
+    - key: confirm-signal
+      name: Confirm signal
+      function: confirm-signal-fn
+      actionVerb: UPDATE
+      description: Confirm or reject a candidate early signal for an incident. Only a
+        person can confirm a signal; the agent must ask before calling this.
+      inputs:
+        incidentKey:
+          title: Incident key
+          type: string
+          required: true
+          description: JSM incident issue key, for example INC-1.
+        signalId:
+          title: Signal ID
+          type: string
+          required: true
+          description: ID of the candidate signal returned by Find prior signals.
+        decision:
+          title: Decision
+          type: string
+          required: true
+          description: "confirm or reject."
+    - key: trace-signal-reach
+      name: Trace signal reach
+      function: trace-signal-reach-fn
+      actionVerb: GET
+      description: Show who saw each confirmed signal before the incident, which teams
+        it reached and where it stopped travelling. Blameless; no individual
+        scoring.
+      inputs:
+        incidentKey:
+          title: Incident key
+          type: string
+          required: true
+          description: JSM incident issue key, for example INC-1.
+    - key: propose-routes
+      name: Propose routes
+      function: propose-routes-fn
+      actionVerb: GET
+      description: Propose routes that would have carried the confirmed signals to the
+        owning team earlier, with the counterfactual lead time for each route.
+      inputs:
+        incidentKey:
+          title: Incident key
+          type: string
+          required: true
+          description: JSM incident issue key, for example INC-1.
+    - key: create-route
+      name: Create route
+      function: create-route-fn
+      actionVerb: CREATE
+      description: Activate a proposed route so future matching signals reach the
+        target team. Requires explicit approval from the user before calling.
+      inputs:
+        incidentKey:
+          title: Incident key
+          type: string
+          required: true
+          description: JSM incident issue key the route came from, for example INC-1.
+        routeId:
+          title: Route ID
+          type: string
+          required: true
+          description: ID of the proposed route returned by Propose routes.
+    - key: write-pir-section
+      name: Write PIR section
+      function: write-pir-section-fn
+      actionVerb: CREATE
+      description: Write the early signals section (timeline, reach and routes) into
+        the incident's post-incident review page in Confluence.
+      inputs:
+        incidentKey:
+          title: Incident key
+          type: string
+          required: true
+          description: JSM incident issue key, for example INC-1.
+        pageId:
+          title: PIR page ID
+          type: string
+          required: true
+          description: Confluence page ID of the post-incident review.
+
+  # --- MCP (Preview): read-only tools only ---
+  rovo:mcp:
+    - key: hindsight-mcp
+      name: Hindsight
+      tools:
+        - find-prior-signals
+        - trace-signal-reach
+        - propose-routes
+
+  # --- Teamwork Graph write (Preview) ---
+  graph:connector:
+    - key: hindsight-graph
+      name: Hindsight signals
+      icons:
+        light: resource:icons;hindsight.svg
+        dark: resource:icons;hindsight.svg
+      objectTypes:
+        - atlassian:document
+        - atlassian:software-service
+      datasource:
+        onConnectionChange:
+          function: on-connection-change
+
+  # --- Storage and AI (adding these later forces a major version upgrade) ---
+  sql:
+    - key: main
+      engine: mysql
+  llm:
+    - key: hindsight-llm
+      model:
+        - claude
+
+  function:
+    - key: ui-resolver
+      handler: index.uiResolver
+    - key: on-work-event
+      handler: index.onWorkEvent
+    - key: app-lifecycle
+      handler: index.onAppLifecycle
+    - key: on-connection-change
+      handler: index.onConnectionChange
+    - key: collect-events
+      handler: index.collectEvents
+      timeoutSeconds: 900
+    - key: score-candidates
+      handler: index.scoreCandidates
+      timeoutSeconds: 900
+    - key: trace-reach
+      handler: index.traceReach
+      timeoutSeconds: 900
+    - key: propose-routes-job
+      handler: index.proposeRoutesJob
+      timeoutSeconds: 900
+    - key: check-sentinel
+      handler: index.checkSentinel
+      timeoutSeconds: 900
+    - key: migrate-schema
+      handler: index.migrateSchema
+      timeoutSeconds: 900
+    - key: demo-job
+      handler: index.demoJob
+      timeoutSeconds: 900
+    - key: purge-expired
+      handler: index.purgeExpired
+    - key: find-prior-signals-fn
+      handler: index.findPriorSignals
+    - key: confirm-signal-fn
+      handler: index.confirmSignal
+    - key: trace-signal-reach-fn
+      handler: index.traceSignalReach
+    - key: propose-routes-fn
+      handler: index.proposeRoutes
+    - key: create-route-fn
+      handler: index.createRoute
+    - key: write-pir-section-fn
+      handler: index.writePirSection
+
+resources:
+  - key: incident-ui
+    path: static/incident/build
+  - key: insights-ui
+    path: static/insights/build
+  - key: setup-ui
+    path: static/setup/build
+  - key: agent-prompt
+    path: prompts
+  - key: icons
+    path: static/icons
+
+permissions:
+  scopes:
+    - read:jira-work
+    - write:jira-work
+    - read:servicedesk-request
+    - read:confluence-content.all
+    - read:confluence-content.summary # page/comment events
+    - read:page:confluence # v2 API
+    - read:space:confluence # v2 API
+    - write:confluence-content # PIR section and Sentinel comments
+    - write:page:confluence # v2 API
+    # Teamwork Graph read (Preview; a missing scope returns empty data, not an error)
+    - read:graph:issue:jira
+    - read:graph:project:jira
+    - read:graph:user:atlassian
+    - read:graph:page:confluence
+    - read:graph:team:atlassian
+    # Teamwork Graph write via graph:connector (Preview)
+    - read:object:jira
+    - write:object:jira
+    - delete:object:jira
