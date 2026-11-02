@@ -1,0 +1,9 @@
+node_modules/
+.forge/
+static/*/build/
+dist/
+coverage/
+*.log
+.env
+.env.*
+.DS_Store
