@@ -8,10 +8,19 @@ import { confluence, isConfluenceRateLimited } from '../adapters/confluence';
 import { isJiraRateLimited, jira } from '../adapters/jira';
 import { COLLECTED_JOB_STATUSES, repo, type ConnectionAction, type JobStatus } from '../adapters/repo';
 import { ensureSchema, requestMigration, runMigrations } from '../adapters/sql';
-import { writeDossier } from '../adapters/teamworkGraph';
+import { deleteObjects, writeDossier } from '../adapters/teamworkGraph';
 import { COLLECT_BUDGET_MS, COLLECT_PAGES_PER_RUN, runCollectStep, type CollectDeps } from '../core/collect';
 import { DEMO_QUEUE, runDemoJob, type DemoJob, type DemoProgress, type DemoRunResult } from '../core/demoJob';
-import { buildDossier, DOSSIER_ALL_INCIDENTS_KEY, DOSSIER_STATUS_KEY, type DossierStatus } from '../core/dossier';
+import {
+  buildDossier,
+  DOSSIER_ALL_INCIDENTS_KEY,
+  DOSSIER_IDS_KEY,
+  DOSSIER_OBJECT_TYPE,
+  DOSSIER_STATUS_KEY,
+  parseDossierIds,
+  withDossierId,
+  type DossierStatus,
+} from '../core/dossier';
 import { INCIDENT_SLOT } from '../core/demoData';
 import { analyzeLock } from '../core/jobs';
 import { SchemaSettingUpError } from '../core/schema';
@@ -251,10 +260,17 @@ export async function collectEvents(event: QueueEvent | undefined): Promise<Invo
  * The dossier is visible to everyone on the site, so it is only written for the demo incident, unless the admin
  * opted in with `settings.dossier_all_incidents = true`.
  */
-async function dossierAllowed(incidentKey: string): Promise<boolean> {
-  if ((await repo.getSetting<unknown>(DOSSIER_ALL_INCIDENTS_KEY)) === true) return true;
+async function dossierAllowed(incidentKey: string): Promise<{ allowed: boolean; demo: boolean }> {
   const artifacts = await repo.listDemoArtifacts();
-  return artifacts.some((a) => a.slot === INCIDENT_SLOT && a.artifactKey === incidentKey);
+  const demo = artifacts.some((a) => a.slot === INCIDENT_SLOT && a.artifactKey === incidentKey);
+  if (demo) return { allowed: true, demo };
+  return { allowed: (await repo.getSetting<unknown>(DOSSIER_ALL_INCIDENTS_KEY)) === true, demo };
+}
+
+/** Remembers a demo dossier id before it is written, so Remove demo data can delete it later. */
+async function trackDossier(id: string): Promise<void> {
+  const ids = parseDossierIds(await repo.getSetting<unknown>(DOSSIER_IDS_KEY));
+  if (!ids.includes(id)) await repo.setSetting(DOSSIER_IDS_KEY, withDossierId(ids, id));
 }
 
 const errorMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err)).slice(0, 300);
@@ -269,7 +285,8 @@ export async function writeIncidentDossier(job: { id: string; incidentKey: strin
   const at = new Date().toISOString();
   let status: DossierStatus;
   try {
-    if (!(await dossierAllowed(incidentKey))) {
+    const { allowed, demo } = await dossierAllowed(incidentKey);
+    if (!allowed) {
       // Not recorded in dossier_last: the setup page reports the demo dossier, not every analysed incident.
       console.info('dossier skipped', { incidentKey, reason: 'not demo incident' });
       return { incidentKey, at, skipped: 'not demo incident' };
@@ -289,6 +306,7 @@ export async function writeIncidentDossier(job: { id: string; incidentKey: strin
         earliestDaysBefore: kept.length > 0 ? Math.max(...kept.map((c) => c.daysBefore)) : null,
         now: new Date(),
       });
+      if (demo) await trackDossier(doc.id);
       const result = await writeDossier(connection.connectionId, doc);
       if (result.error || !result.success) {
         console.warn('dossier failed', { incidentKey, accepted: result.accepted, rejected: result.rejected, error: result.error ?? 'not successful' });
@@ -343,6 +361,7 @@ function seedDeps(progress: DemoProgress): SeedDeps {
     jira,
     confluence,
     repo,
+    graph: { deleteDossiers: (connectionId, ids) => deleteObjects(connectionId, DOSSIER_OBJECT_TYPE, ids) },
     now: Date.now,
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     deadline: Date.now() + DEMO_BUDGET_MS,

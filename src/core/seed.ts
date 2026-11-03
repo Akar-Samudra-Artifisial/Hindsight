@@ -1,5 +1,6 @@
 import type { ConfluenceClient } from '../adapters/confluence';
 import type { JiraClient } from '../adapters/jira';
+import type { DeleteSummary } from '../adapters/teamworkGraph';
 import type { DemoArtifact, DemoArtifactInput, EventRef, EventSource, Repo, ScenarioEventInput } from '../adapters/repo';
 import {
   adfParagraphs,
@@ -16,6 +17,7 @@ import {
   type DemoSpec,
 } from './demoData';
 import type { DemoProgress, DemoRunResult } from './demoJob';
+import { DOSSIER_IDS_KEY, dossierId, MAX_TRACKED_DOSSIERS, parseDossierIds } from './dossier';
 import { analyzeLock, ISSUE_PROPERTY } from './jobs';
 
 /**
@@ -51,7 +53,10 @@ export interface SeedDeps {
     | 'deleteJobsForIncident'
     | 'deleteIncident'
     | 'releaseAppLock'
+    | 'getActiveGraphConnection'
   >;
+  /** Teamwork Graph: deletes dossier objects (at most 100 ids) for a connection; never throws. */
+  graph: { deleteDossiers(connectionId: string, ids: readonly string[]): Promise<DeleteSummary> };
   now(): number;
   sleep(ms: number): Promise<void>;
   /** Epoch ms after which no new step starts (the job ends as partial). */
@@ -591,11 +596,44 @@ export async function resetShowcase(deps: SeedDeps): Promise<DemoRunResult & { i
   return { complete: true, incidentKey: incident.artifactKey, events };
 }
 
+const errorText = (err: unknown): string => (err instanceof Error ? err.message : String(err)).slice(0, 300);
+
+/**
+ * Deletes the tracked demo dossiers (plus the current demo incident's) from Teamwork Graph. Never throws: without an
+ * active connection it is skipped (disconnecting already removed the objects); a failure becomes a warning and the
+ * ids stay tracked so the next Remove tries again.
+ */
+async function removeDossiers(incidentKey: string | null, deps: SeedDeps): Promise<{ deleted: number; warnings: string[] }> {
+  try {
+    const tracked = parseDossierIds(await deps.repo.getSetting<unknown>(DOSSIER_IDS_KEY));
+    const ids = [...new Set([...tracked, ...(incidentKey ? [dossierId(incidentKey)] : [])])].slice(-MAX_TRACKED_DOSSIERS);
+    if (ids.length === 0) return { deleted: 0, warnings: [] };
+    const connection = await deps.repo.getActiveGraphConnection();
+    if (!connection) {
+      console.info('dossier delete skipped', { ids, reason: 'no connection' });
+      return { deleted: 0, warnings: [] };
+    }
+    const result = await deps.graph.deleteDossiers(connection.connectionId, ids);
+    console.info('dossier deleted', { ids, result });
+    if (!result.success) {
+      return { deleted: 0, warnings: [`The Teamwork Graph dossier could not be deleted (${result.error ?? 'not successful'}). Run Remove demo data again, or disconnect and reconnect the Hindsight connector.`] };
+    }
+    await deps.repo.setSetting(DOSSIER_IDS_KEY, []);
+    return { deleted: ids.length, warnings: [] };
+  } catch (err) {
+    console.warn('dossier delete failed', { error: errorText(err) });
+    return { deleted: 0, warnings: [`The Teamwork Graph dossier could not be deleted (${errorText(err)}). Run Remove demo data again, or disconnect and reconnect the Hindsight connector.`] };
+  }
+}
+
 /**
  * Remove demo data: deletes the issues and pages the app created (their comments go with them), their event rows,
- * the demo incident's analyses and the slot rows. Projects, the space and the service mapping stay.
+ * the demo incident's analyses, its Teamwork Graph dossiers and the slot rows. Projects, the space and the service
+ * mapping stay.
  */
-export async function removeDemoData(deps: SeedDeps): Promise<DemoRunResult & { deletedIssues: number; deletedPages: number; kept: number }> {
+export async function removeDemoData(
+  deps: SeedDeps,
+): Promise<DemoRunResult & { deletedIssues: number; deletedPages: number; kept: number; deletedDossiers?: number; warnings?: string[] }> {
   const slots = new Slots(await deps.repo.listDemoArtifacts(), deps);
   const incidentKey = slots.get(INCIDENT_SLOT)?.artifactKey ?? null;
   const ref = (a: DemoArtifact): EventRef => ({ source: a.source, artifactId: a.artifactId, commentId: a.commentId });
@@ -623,11 +661,19 @@ export async function removeDemoData(deps: SeedDeps): Promise<DemoRunResult & { 
   for (const a of rest) if (a.source === 'confluence' && a.commentId !== '') console.warn('demo remove: comment left on a page the app did not create', { slot: a.slot });
   await deps.repo.deleteEventsByRefs(rest.filter((a) => !isMarker(a)).map(ref));
   await slots.drop(rest.map((a) => a.slot));
+  const dossiers = await removeDossiers(incidentKey, deps);
   if (incidentKey) {
     await deps.repo.deleteJobsForIncident(incidentKey);
     await deps.repo.deleteIncident(incidentKey);
     await deps.repo.releaseAppLock(analyzeLock(incidentKey));
   }
   await deps.repo.setSetting(T0_SETTING, null);
-  return { complete: true, deletedIssues, deletedPages, kept: rest.filter((a) => !a.createdByApp && !isMarker(a)).length };
+  return {
+    complete: true,
+    deletedIssues,
+    deletedPages,
+    kept: rest.filter((a) => !a.createdByApp && !isMarker(a)).length,
+    deletedDossiers: dossiers.deleted,
+    warnings: dossiers.warnings,
+  };
 }
