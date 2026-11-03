@@ -1,7 +1,10 @@
 import { invoke } from '@forge/bridge';
 import { useCallback, useEffect, useState } from 'react';
 import { mount } from './mount';
+import { ReachMap } from './ReachMap';
+import { RoutesList } from './RoutesList';
 import { SignalCard, type Decision, type SignalView } from './SignalCard';
+import { stopCopy, type ReachView } from './reach';
 
 /** Incident panel: Analyze, job status + funnel, and the scored early signals with Confirm / Reject / Undo. */
 
@@ -36,6 +39,56 @@ interface AnalysisReply {
   hiddenCount: number;
   scoreFailedCount: number;
   scoreFailed: { quoteNotFound: number; invalidOutput: number };
+  reach: ReachView;
+}
+
+type Tab = 'signals' | 'reach' | 'routes';
+const TABS: [Tab, string][] = [
+  ['signals', 'Signals'],
+  ['reach', 'Reach map'],
+  ['routes', 'Routes'],
+];
+
+const NO_GRAPH: Record<string, string> = {
+  no_responder_team: 'Graph context not available: this incident has no responder team. An admin can set the owner team id of its service on the Hindsight setup page.',
+  no_site_id: 'Graph context not available: Hindsight could not tell which site this is.',
+};
+
+const ROUTES_NOTE: Record<string, string> = {
+  none_needed: 'No routes needed: every confirmed signal with graph context reached the responder team.',
+  no_graph: 'No routes yet: trace reach first. Routes are proposed from confirmed signals that did not reach the responder team.',
+  no_source: 'No routes: the signals that did not reach the responder team have no space, project, component or label to route from.',
+};
+
+function Metric({ label, value, note }: { label: string; value: string; note?: string }) {
+  return (
+    <div style={{ flex: '1 1 0', minWidth: 110, background: '#f7f8f9', borderRadius: 6, padding: '8px 10px' }}>
+      <div style={{ fontSize: 11, color: '#626f86', textTransform: 'uppercase', letterSpacing: 0.4 }}>{label}</div>
+      <div style={{ fontSize: 20, fontWeight: 700, color: '#172b4d' }}>{value}</div>
+      {note && <div style={{ fontSize: 11, color: '#626f86' }}>{note}</div>}
+    </div>
+  );
+}
+
+function MetricsStrip({ reach }: { reach: ReachView }) {
+  if (!reach.graphAvailable) return <p style={s.muted}>{NO_GRAPH[reach.reason ?? 'no_responder_team']}</p>;
+  const m = reach.metrics;
+  if (!m) return <p style={s.muted}>Confirm a signal to compute reach.</p>;
+  const responder = reach.responderTeamName ?? 'the responder team';
+  return (
+    <section aria-label="Reach metrics">
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '8px 0' }}>
+        <Metric label="First signal" value={`${m.firstSignalDays} d`} note="before the incident" />
+        <Metric label="Awareness gap" value={`${m.awarenessGapDays} d`} note={m.reached > 0 ? `until a signal reached ${responder}` : `no signal reached ${responder}`} />
+        <Metric
+          label="Reach"
+          value={m.considered > 0 ? `${m.reached}/${m.considered}` : '–'}
+          note={`confirmed signals${m.unknown > 0 ? ` · ${m.unknown} without graph context` : ''}${m.timeUnknown > 0 ? ` · ${m.timeUnknown} time unknown` : ''}`}
+        />
+      </div>
+      {m.stopPoint && m.reached < m.considered && <p style={{ margin: '4px 0', fontSize: 13, fontWeight: 600, color: '#ae2e24' }}>{stopCopy(m.stopPoint, responder)}</p>}
+    </section>
+  );
 }
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
@@ -76,6 +129,9 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [deciding, setDeciding] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [tab, setTab] = useState<Tab>('signals');
+  const [tracing, setTracing] = useState(false);
+  const [approving, setApproving] = useState<string | null>(null);
 
   const load = useCallback(() => {
     invoke('getAnalysis', {})
@@ -118,6 +174,31 @@ function App() {
       })
       .catch((e: unknown) => setError(errorText(e)))
       .finally(() => setDeciding(null));
+  };
+
+  const trace = () => {
+    setTracing(true);
+    invoke('traceReach', {})
+      .then((r) => {
+        const res = r as { error?: string };
+        if (res.error) setError(res.error);
+        else setError(null);
+        load();
+      })
+      .catch((e: unknown) => setError(errorText(e)))
+      .finally(() => setTracing(false));
+  };
+
+  const approve = (routeId: string) => {
+    setApproving(routeId);
+    invoke('decideRoute', { routeId })
+      .then((r) => {
+        const res = r as { error?: string };
+        if (res.error) setError(res.error);
+        load();
+      })
+      .catch((e: unknown) => setError(errorText(e)))
+      .finally(() => setApproving(null));
   };
 
   if (reply && 'ready' in reply && !reply.ready) {
@@ -186,9 +267,70 @@ function App() {
           {job.status === 'done' && signals.length === 0 && <p style={s.muted}>No early signals found in the lookback window.</p>}
         </section>
       )}
-      {signals.map((sig) => (
-        <SignalCard key={sig.id} signal={sig} busy={deciding !== null} onDecide={(d) => decide(sig.id, d)} />
-      ))}
+      {analysis && signals.length > 0 && (
+        <>
+          <MetricsStrip reach={analysis.reach} />
+          <div role="tablist" aria-label="Analysis views" style={{ display: 'flex', gap: 4, borderBottom: '2px solid #dcdfe4', margin: '10px 0 4px' }}>
+            {TABS.map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                role="tab"
+                id={`tab-${key}`}
+                aria-selected={tab === key}
+                aria-controls={`panel-${key}`}
+                onClick={() => setTab(key)}
+                style={{
+                  border: 'none',
+                  background: 'none',
+                  padding: '6px 10px',
+                  marginBottom: -2,
+                  cursor: 'pointer',
+                  fontSize: 13,
+                  fontWeight: 600,
+                  color: tab === key ? '#0c66e4' : '#44546f',
+                  borderBottom: `2px solid ${tab === key ? '#0c66e4' : 'transparent'}`,
+                }}
+              >
+                {label}
+                {key === 'routes' && analysis.reach.routes.length > 0 ? ` (${analysis.reach.routes.length})` : ''}
+              </button>
+            ))}
+          </div>
+          <section role="tabpanel" id={`panel-${tab}`} aria-labelledby={`tab-${tab}`}>
+            {tab === 'signals' &&
+              signals.map((sig) => <SignalCard key={sig.id} signal={sig} busy={deciding !== null} onDecide={(d) => decide(sig.id, d)} />)}
+            {tab !== 'signals' && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '8px 0', flexWrap: 'wrap' }}>
+                <button type="button" onClick={trace} disabled={tracing || confirmed === 0 || !analysis.reach.graphAvailable}>
+                  {tracing ? 'Tracing…' : analysis.reach.paths.length > 0 ? 'Trace again' : 'Trace reach'}
+                </button>
+                {analysis.reach.metrics && analysis.reach.metrics.pending > 0 && (
+                  <span style={s.warn}>
+                    Partial: {plural(analysis.reach.metrics.pending, 'signal was', 'signals were')} not traced yet.
+                    <button type="button" style={s.link} onClick={trace} disabled={tracing}>
+                      Trace remaining
+                    </button>
+                  </span>
+                )}
+                {analysis.reach.simulated && <span style={s.muted}>Simulated history: touch times are not compared with the incident start.</span>}
+              </div>
+            )}
+            {tab === 'reach' &&
+              (analysis.reach.paths.length > 0 ? (
+                <ReachMap reach={analysis.reach} signals={signals} />
+              ) : (
+                <p style={s.muted}>{confirmed === 0 ? 'Confirm a signal, then trace where it travelled.' : 'Not traced yet. Trace reach shows which teams saw each confirmed signal.'}</p>
+              ))}
+            {tab === 'routes' &&
+              (analysis.reach.routes.length > 0 ? (
+                <RoutesList routes={analysis.reach.routes} responder={analysis.reach.responderTeamName ?? 'the responder team'} busy={approving} onApprove={approve} />
+              ) : (
+                <p style={s.muted}>{ROUTES_NOTE[analysis.reach.routesNote ?? 'no_graph']}</p>
+              ))}
+          </section>
+        </>
+      )}
     </main>
   );
 }

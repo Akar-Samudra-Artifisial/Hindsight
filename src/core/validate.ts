@@ -26,6 +26,19 @@ export function parseSignalId(value: unknown): string {
   return id.toLowerCase();
 }
 
+/** Route id from the panel or a Rovo action. */
+export function parseRouteId(value: unknown): string {
+  const id = typeof value === 'string' ? value.trim() : '';
+  if (!SIGNAL_ID.test(id)) throw new InputError('routeId must be a route id returned by Propose routes.');
+  return id.toLowerCase();
+}
+
+/** Optional signal id: absent or empty → undefined. */
+export function parseOptionalSignalId(value: unknown): string | undefined {
+  if (value === undefined || value === null || (typeof value === 'string' && value.trim() === '')) return undefined;
+  return parseSignalId(value);
+}
+
 /** `confirm`, `reject` or `undo` (case-insensitive). */
 export function parseDecision(value: unknown): 'confirm' | 'reject' | 'undo' {
   const d = typeof value === 'string' ? value.trim().toLowerCase() : '';

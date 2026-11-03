@@ -20,6 +20,8 @@ const repoMock = vi.hoisted(() => ({
   upsertSignals: vi.fn(),
   markCandidates: vi.fn(),
   deleteStaleProposedSignals: vi.fn(),
+  listReachPaths: vi.fn(async () => []),
+  listRoutes: vi.fn(async () => []),
 }));
 const llm = vi.hoisted(() => ({ pickModels: vi.fn(), chatTool: vi.fn() }));
 vi.mock('@forge/llm', () => ({ chat: vi.fn(), list: vi.fn() }));

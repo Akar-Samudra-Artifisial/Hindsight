@@ -41,12 +41,20 @@ const repoMock = vi.hoisted(() => ({
   getSignal: vi.fn(),
   updateSignalStatus: vi.fn(),
   insertDecision: vi.fn(),
+  listReachPaths: vi.fn(async () => []),
+  listRoutes: vi.fn(async () => []),
 }));
 vi.mock('../src/adapters/repo', () => ({ repo: repoMock }));
 const jiraMock = vi.hoisted(() => ({ isAdminAsUser: vi.fn(), getIncidentAsUser: vi.fn(), visibleIssueIds: vi.fn() }));
 vi.mock('../src/adapters/jira', () => ({ jira: jiraMock }));
 const confluenceMock = vi.hoisted(() => ({ visiblePageIds: vi.fn() }));
 vi.mock('../src/adapters/confluence', () => ({ confluence: confluenceMock }));
+
+const lookupMock = vi.hoisted(() => ({ teamsOf: vi.fn(), contributorsOf: vi.fn() }));
+vi.mock('../src/adapters/teamworkGraph', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/adapters/teamworkGraph')>()),
+  createTeamLookup: () => lookupMock,
+}));
 
 await import('../src/surfaces/ui');
 
@@ -75,6 +83,8 @@ describe('setup resolvers', () => {
     ['deleteServiceMapping', { serviceKey: 'checkout' }],
     ['startDemoJob', { kind: 'load' }],
     ['writeTestDossier', {}],
+    ['teamSpike', {}],
+    ['stampDemo', {}],
   ];
 
   it.each(mutations)('%s refuses calls from another module', async (name, payload) => {
@@ -179,5 +189,48 @@ describe('incident panel: getAnalysis and decideSignal', () => {
     expect(await call('decideSignal', { signalId: SIG, decision: 'maybe' }, panel)).toEqual({ error: 'decision must be confirm, reject or undo.' });
     repoMock.getSignal.mockResolvedValue({ ...row(SIG, 'confirmed', 'e1', 3) });
     expect(await call('decideSignal', { signalId: SIG, decision: 'reject' }, panel)).toEqual({ error: 'This signal is already confirmed. Undo it first.' });
+  });
+});
+
+describe('teamSpike', () => {
+  const CLOUD = '0f3a1b2c-1111-2222-3333-444455556666';
+  const ctx = { ...setup, accountId: '557058:aaaaaaaa-bbbb-cccc-dddd-eeee11112222', cloudId: CLOUD };
+
+  beforeEach(() => {
+    lookupMock.teamsOf.mockReset().mockImplementation(async (id: string) =>
+      id.endsWith('2222') ? { ok: true, status: 200, teams: [{ id: 't1', name: 'Arkana Platform' }] } : { ok: false, status: 200, error: 'Not permitted' },
+    );
+    lookupMock.contributorsOf.mockReset().mockResolvedValue({ ok: true, status: 200, accountIds: ['557058:aaaaaaaa-bbbb-cccc-dddd-eeee11112222'], truncated: false });
+  });
+
+  it('looks up the current user and the given ids, with shortened account ids only', async () => {
+    const reply = (await call('teamSpike', { accountIds: ['712020:ffff0000-1111-2222-3333-444455559999', ctx.accountId], pageId: '5079131' }, ctx)) as {
+      results: { accountId: string; source: string; ok: boolean; teams: unknown[]; error: string | null }[];
+      contributors: { count: number; results: { source: string }[] };
+    };
+    expect(reply.results).toEqual([
+      { accountId: '…11112222', source: 'self', ok: true, status: 200, teams: [{ id: 't1', name: 'Arkana Platform' }], error: null },
+      { accountId: '…55559999', source: 'input', ok: false, status: 200, teams: [], error: 'Not permitted' },
+    ]);
+    expect(reply.contributors).toMatchObject({ pageId: '5079131', ok: true, count: 1, results: [{ source: 'contributor', accountId: '…11112222' }] });
+    expect(lookupMock.contributorsOf).toHaveBeenCalledWith('5079131');
+    const logged = JSON.stringify((console.info as unknown as { mock: { calls: unknown[][] } }).mock.calls);
+    expect(logged).not.toContain('557058:');
+    expect(logged).not.toContain('712020:');
+  });
+
+  it('rejects malformed input', async () => {
+    expect(await call('teamSpike', { accountIds: 'abc' }, ctx)).toEqual({ error: 'accountIds must be a list of account ids.' });
+    expect(await call('teamSpike', { accountIds: ['bad id!'] }, ctx)).toEqual({ error: '"…bad id!" is not an account id.' });
+    expect(await call('teamSpike', { pageId: 'x1' }, ctx)).toEqual({ error: 'pageId must be a numeric Confluence page id.' });
+    expect(lookupMock.teamsOf).not.toHaveBeenCalled();
+  });
+});
+
+describe('reach resolvers', () => {
+  it('traceReach and decideRoute validate their input', async () => {
+    const panel = { moduleKey: 'hindsight-incident', accountId: 'acc-1', extension: { issue: { key: 'INC-1' } } };
+    expect(await call('traceReach', { signalId: 'x' }, panel)).toEqual({ error: 'signalId must be a signal id returned by Find prior signals.' });
+    expect(await call('decideRoute', { routeId: 'x' }, panel)).toEqual({ error: 'routeId must be a route id returned by Propose routes.' });
   });
 });

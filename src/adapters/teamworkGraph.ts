@@ -22,7 +22,16 @@ export const USER_WORK_ITEMS_QUERY = `query hindsight_userWorkItems($userId: ID!
   }
 }`;
 
+/** Contributors of one Confluence page (first 25); only account ids are read, names never. */
+export const PAGE_CONTRIBUTORS_QUERY = `query hindsight_pageContributors($id: ID!) {
+  confluencePageContributors(id: $id, first: 25) {
+    edges { node { __typename ... on AtlassianUser { id accountId } } }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+
 export const userAri = (accountId: string): string => `ari:cloud:identity::user/${accountId}`;
+export const pageAri = (cloudId: string, pageId: string): string => `ari:cloud:confluence:${cloudId}:page/${pageId}`;
 /** Value of the `X-Query-Context` header; without it the endpoint answers `data: null`. */
 export const queryContext = (cloudId: string): string => `ari:cloud:platform::site/${cloudId}`;
 
@@ -79,6 +88,82 @@ export async function readSpike(cloudId: string, accountId: string): Promise<Spi
     runGraphQuery(cloudId, USER_WORK_ITEMS_QUERY, variables, 'hindsight_userWorkItems'),
   ]);
   return { cloudId, teams, workItems };
+}
+
+export interface GraphTeam {
+  id: string;
+  name: string;
+}
+
+export type TeamsResult = { ok: true; status: number; teams: GraphTeam[] } | { ok: false; status: number; error: string };
+export type ContributorsResult = { ok: true; status: number; accountIds: string[]; truncated: boolean } | { ok: false; status: number; error: string };
+
+type GraphQueryRunner = typeof runGraphQuery;
+
+/** Edges of the single top-level connection in `data` (null when the shape is unexpected). */
+function connectionOf(data: unknown, field: string): { nodes: Record<string, unknown>[]; hasNextPage: boolean } | null {
+  const conn = data && typeof data === 'object' ? (data as Record<string, unknown>)[field] : undefined;
+  if (!conn || typeof conn !== 'object') return null;
+  const edges = (conn as { edges?: unknown }).edges;
+  if (!Array.isArray(edges)) return null;
+  const nodes = edges
+    .map((e: unknown) => (e && typeof e === 'object' ? (e as { node?: unknown }).node : undefined))
+    .filter((n): n is Record<string, unknown> => !!n && typeof n === 'object');
+  const pageInfo = (conn as { pageInfo?: { hasNextPage?: unknown } }).pageInfo;
+  return { nodes, hasNextPage: pageInfo?.hasNextPage === true };
+}
+
+export function parseTeams(data: unknown): GraphTeam[] | null {
+  const conn = connectionOf(data, 'atlassianUserInTeams');
+  if (!conn) return null;
+  return conn.nodes
+    .filter((n) => n.__typename === 'AtlassianTeam' && typeof n.id === 'string')
+    .map((n) => ({ id: n.id as string, name: typeof n.displayName === 'string' ? n.displayName : '' }));
+}
+
+export function parseContributors(data: unknown): { accountIds: string[]; truncated: boolean } | null {
+  const conn = connectionOf(data, 'confluencePageContributors');
+  if (!conn) return null;
+  const ids = conn.nodes.filter((n) => n.__typename === 'AtlassianUser' && typeof n.accountId === 'string').map((n) => n.accountId as string);
+  return { accountIds: [...new Set(ids)], truncated: conn.hasNextPage };
+}
+
+export interface TeamLookup {
+  teamsOf(accountId: string): Promise<TeamsResult>;
+  contributorsOf(pageId: string): Promise<ContributorsResult>;
+}
+
+/**
+ * Team and contributor reads as the current user, cached for the lifetime of the returned object (create one per
+ * resolver request). Never throws; failures come back as `ok: false`.
+ */
+export function createTeamLookup(cloudId: string, run: GraphQueryRunner = runGraphQuery): TeamLookup {
+  const teams = new Map<string, Promise<TeamsResult>>();
+  const contributors = new Map<string, Promise<ContributorsResult>>();
+  return {
+    teamsOf(accountId) {
+      const cached = teams.get(accountId);
+      if (cached) return cached;
+      const pending = run(cloudId, USER_TEAMS_QUERY, { userId: userAri(accountId) }, 'hindsight_userTeams').then((r): TeamsResult => {
+        if (!r.ok) return r;
+        const parsed = parseTeams(r.data);
+        return parsed ? { ok: true, status: r.status, teams: parsed } : { ok: false, status: r.status, error: 'unexpected atlassianUserInTeams shape' };
+      });
+      teams.set(accountId, pending);
+      return pending;
+    },
+    contributorsOf(pageId) {
+      const cached = contributors.get(pageId);
+      if (cached) return cached;
+      const pending = run(cloudId, PAGE_CONTRIBUTORS_QUERY, { id: pageAri(cloudId, pageId) }, 'hindsight_pageContributors').then((r): ContributorsResult => {
+        if (!r.ok) return r;
+        const parsed = parseContributors(r.data);
+        return parsed ? { ok: true, status: r.status, ...parsed } : { ok: false, status: r.status, error: 'unexpected confluencePageContributors shape' };
+      });
+      contributors.set(pageId, pending);
+      return pending;
+    },
+  };
 }
 
 export const SPIKE_OBJECT_ID = 'hindsight-spike-1';

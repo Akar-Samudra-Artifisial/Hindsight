@@ -43,7 +43,7 @@ export function isJiraRateLimited(err: unknown): boolean {
 
 export interface RawComment {
   id: string;
-  author?: { accountId?: string };
+  author?: { accountId?: string; accountType?: string };
   body?: unknown;
   created?: string;
   updated?: string;
@@ -68,7 +68,7 @@ export interface RawIssue {
     labels?: string[];
     status?: { statusCategory?: { key?: string } };
     resolution?: { name?: string } | null;
-    reporter?: { accountId?: string } | null;
+    reporter?: { accountId?: string; accountType?: string } | null;
     priority?: { name?: string } | null;
     resolutiondate?: string | null;
     comment?: { comments?: RawComment[]; total?: number; maxResults?: number; startAt?: number };
@@ -393,6 +393,30 @@ export const jira = {
   async countIssues(jql: string): Promise<number> {
     const body = await request<{ count?: number }>('app', 'POST', route`/rest/api/3/search/approximate-count`, { jql });
     return body.count ?? 0;
+  },
+
+  // --- Reach -----------------------------------------------------------------------------------
+
+  /** Watchers of the issue with their account type (`atlassian`, `app`, `customer`), as the app. */
+  async getWatchers(issueIdOrKey: string): Promise<{ accountId: string; accountType: string | null }[]> {
+    const body = await request<{ watchers?: { accountId?: string; accountType?: string }[] }>('app', 'GET', route`/rest/api/3/issue/${issueIdOrKey}/watchers`);
+    return (body.watchers ?? []).flatMap((w) => (typeof w.accountId === 'string' && w.accountId !== '' ? [{ accountId: w.accountId, accountType: w.accountType ?? null }] : []));
+  },
+
+  /** Adds the current user as a watcher of the issue (idempotent). Resolvers only. */
+  async addWatcherAsUser(issueIdOrKey: string, accountId: string): Promise<void> {
+    await request<unknown>('user', 'POST', route`/rest/api/3/issue/${issueIdOrKey}/watchers`, accountId);
+  },
+
+  /** Site cloud id from `/_edge/tenant_info` as the app [VERIFY]; null when unavailable. */
+  async cloudId(): Promise<string | null> {
+    try {
+      const body = await request<{ cloudId?: string }>('app', 'GET', route`/_edge/tenant_info`);
+      return typeof body.cloudId === 'string' && body.cloudId !== '' ? body.cloudId : null;
+    } catch (err) {
+      console.warn('jira tenant_info failed', { error: err instanceof Error ? err.message.slice(0, 200) : String(err) });
+      return null;
+    }
   },
 
   /** Issue id, key and site base URL as the app; undefined when the issue does not exist. */

@@ -5,12 +5,15 @@ import { confluence } from '../adapters/confluence';
 import { jira } from '../adapters/jira';
 import { repo, type AnalysisJob } from '../adapters/repo';
 import { ensureSchema } from '../adapters/sql';
-import { cloudIdFromInstallContext, readSpike } from '../adapters/teamworkGraph';
+import { cloudIdFromInstallContext, createTeamLookup, readSpike } from '../adapters/teamworkGraph';
 import { decideSignal, listVisibleSignals } from '../core/decisions';
 import { INCIDENT_SLOT } from '../core/demoData';
 import { DEMO_QUEUE, publicJob, readDemoJob, startDemoJob } from '../core/demoJob';
 import { DOSSIER_STATUS_KEY, type DossierStatus } from '../core/dossier';
+import { stampDemo } from '../core/demoStamp';
+import { activateRoute, readReach, runTrace } from '../core/reachFlow';
 import { containerNotes, existingContainerWarnings } from '../core/seed';
+import { reachDeps } from './reachDeps';
 import { startAnalysis } from '../core/jobs';
 import { MIGRATIONS } from '../core/migrations';
 import { SchemaSettingUpError } from '../core/schema';
@@ -20,6 +23,8 @@ import {
   parseDecision,
   parseDemoKind,
   parseIncidentKey,
+  parseOptionalSignalId,
+  parseRouteId,
   parseServiceKey,
   parseServiceMapping,
   parseSignalId,
@@ -146,12 +151,14 @@ resolver.define('getAnalysis', async ({ payload, context }) =>
     const [job, stored] = await Promise.all([repo.getLatestJobForIncident(incidentKey), repo.getIncident(incidentKey)]);
     const simulated = { simulated: stored?.scenarioStartedAt != null, scenarioStartedAt: stored?.scenarioStartedAt ?? null };
     const { signals, hiddenCount } = await listVisibleSignals(incidentKey, { repo, ...accessDeps });
-    if (!job) return { ready: true, incidentKey, ...simulated, job: null, funnel: null, signals, hiddenCount, scoreFailedCount: 0, scoreFailed: { quoteNotFound: 0, invalidOutput: 0 } };
+    const reach = await readReach(incidentKey, new Set(signals.map((x) => x.id)), { repo });
+    if (!job) return { ready: true, incidentKey, ...simulated, job: null, funnel: null, signals, hiddenCount, scoreFailedCount: 0, scoreFailed: { quoteNotFound: 0, invalidOutput: 0 }, reach };
     const [counts, errors] = await Promise.all([repo.candidateStatusCounts(job.id), repo.scoreErrorCounts(job.id)]);
     return {
       ready: true,
       incidentKey,
       ...simulated,
+      reach,
       job: jobView(job),
       funnel: { scanned: job.scannedCount, stored: job.storedCount, candidates: job.candidateCount, truncated: job.truncatedCount },
       signals,
@@ -180,6 +187,51 @@ resolver.define('decideSignal', async ({ payload, context }) =>
   }),
 );
 
+const contextCloudId = (ctx: ResolverContext): string | undefined => ctx.cloudId || cloudIdFromInstallContext(ctx.installContext);
+
+/** Traces the confirmed signals (or one `signalId`) as the current user and recomputes the routes. */
+resolver.define('traceReach', async ({ payload, context }) =>
+  guarded(async () => {
+    const ctx = context as ResolverContext;
+    const incidentKey = incidentKeyOf(payload, ctx);
+    const signalId = parseOptionalSignalId(payload['signalId']);
+    await ensureSchema();
+    return { ready: true, ...(await runTrace(incidentKey, { via: 'resolver', ...(signalId ? { signalId } : {}) }, reachDeps(contextCloudId(ctx)))) };
+  }),
+);
+
+/** Approves a proposed route (→ active) as the current user. */
+resolver.define('decideRoute', async ({ payload, context }) =>
+  guarded(async () => {
+    const ctx = context as ResolverContext;
+    const routeId = parseRouteId(payload['routeId']);
+    if (!ctx.accountId) throw new InputError('No user in context.');
+    await ensureSchema();
+    const result = await activateRoute(routeId, ctx.accountId, reachDeps(contextCloudId(ctx)));
+    return { ready: true, ...result };
+  }),
+);
+
+/**
+ * Setup, admin only: "Reviewed by" note on the S1 demo page and the admin as watcher of the PAY story and the two S2
+ * tickets, as the admin, so Teamwork Graph has a human touch on the demo artifacts. Idempotent.
+ */
+resolver.define('stampDemo', async ({ context }) =>
+  guarded(async () => {
+    const accountId = await requireSetupAdmin(context as ResolverContext, 'stampDemo');
+    await ensureSchema();
+    const result = await stampDemo(accountId, {
+      listDemoArtifacts: () => repo.listDemoArtifacts(),
+      getPageAsUser: (id) => confluence.getPageAsUser(id),
+      updatePageAsUser: (id, page) => confluence.updatePageAsUser(id, page),
+      addWatcherAsUser: (key, id) => jira.addWatcherAsUser(key, id),
+    });
+    console.info('demo stamped', { pages: result.pages + result.pagesAlready, watchers: result.watchers, newPages: result.pages, failed: result.failed.length });
+    if (result.failed.length > 0) console.warn('demo stamp issues', { failed: result.failed });
+    return { ready: true, ...result };
+  }),
+);
+
 /** Teamwork Graph connector status for the setup page; never returns the connectionId. */
 resolver.define('getGraphConnection', async ({ context }) => {
   const ctx = context as ResolverContext;
@@ -199,6 +251,74 @@ resolver.define('twgSpike', async ({ context }) => {
   if (!cloudId) return { error: 'Site id unavailable.' };
   return readSpike(cloudId, ctx.accountId);
 });
+
+const ACCOUNT_ID = /^[A-Za-z0-9:_-]{1,128}$/;
+const MAX_SPIKE_ACCOUNTS = 10;
+const MAX_SPIKE_CONTRIBUTORS = 5;
+/** Last 8 characters: enough to tell test accounts apart without exposing the account id. */
+const shortId = (accountId: string): string => `…${accountId.slice(-8)}`;
+
+function parseSpikeAccountIds(value: unknown): string[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value) || !value.every((v) => typeof v === 'string')) throw new InputError('accountIds must be a list of account ids.');
+  const ids = [...new Set(value.map((v: string) => v.trim()).filter((v) => v !== ''))];
+  if (ids.length > MAX_SPIKE_ACCOUNTS) throw new InputError(`At most ${MAX_SPIKE_ACCOUNTS} account ids.`);
+  for (const id of ids) if (!ACCOUNT_ID.test(id)) throw new InputError(`"${shortId(id)}" is not an account id.`);
+  return ids;
+}
+
+function parseSpikePageId(value: unknown): string | null {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (text === '') return null;
+  if (!/^[0-9]{1,20}$/.test(text)) throw new InputError('pageId must be a numeric Confluence page id.');
+  return text;
+}
+
+/**
+ * Spike [VERIFY]: can the current user's session read `atlassianUserInTeams` for OTHER account ids? Looks up the
+ * current user plus the given ids (and, optionally, up to 5 contributors of a page). Admin only; replies and logs
+ * carry shortened account ids only.
+ */
+resolver.define('teamSpike', async ({ payload, context }) =>
+  guarded(async () => {
+    const ctx = context as ResolverContext;
+    const self = await requireSetupAdmin(ctx, 'teamSpike');
+    const cloudId = ctx.cloudId || cloudIdFromInstallContext(ctx.installContext);
+    if (!cloudId) return { error: 'Site id unavailable.' };
+    const accountIds = parseSpikeAccountIds(payload['accountIds']);
+    const pageId = parseSpikePageId(payload['pageId']);
+    const lookup = createTeamLookup(cloudId);
+
+    const lookupTeams = async (accountId: string, source: 'self' | 'input' | 'contributor') => {
+      const r = await lookup.teamsOf(accountId);
+      return {
+        accountId: shortId(accountId),
+        source,
+        ok: r.ok,
+        status: r.status,
+        teams: r.ok ? r.teams : [],
+        error: r.ok ? null : r.error,
+      };
+    };
+
+    const results = await Promise.all([self, ...accountIds.filter((id) => id !== self)].map((id) => lookupTeams(id, id === self ? 'self' : 'input')));
+    let contributors: Record<string, unknown> | null = null;
+    if (pageId) {
+      const c = await lookup.contributorsOf(pageId);
+      if (c.ok) {
+        const teamsOfContributors = await Promise.all(c.accountIds.slice(0, MAX_SPIKE_CONTRIBUTORS).map((id) => lookupTeams(id, 'contributor')));
+        contributors = { pageId, ok: true, status: c.status, count: c.accountIds.length, truncated: c.truncated, results: teamsOfContributors };
+      } else {
+        contributors = { pageId, ok: false, status: c.status, error: c.error };
+      }
+    }
+    console.info('team spike', {
+      results: results.map((r) => ({ source: r.source, ok: r.ok, status: r.status, teams: r.teams.length })),
+      contributors: contributors ? { ok: contributors['ok'], count: contributors['count'] ?? null } : null,
+    });
+    return { cloudId, results, contributors };
+  }),
+);
 
 // --- Service mappings (setup, admin only) ---------------------------------------------------------
 

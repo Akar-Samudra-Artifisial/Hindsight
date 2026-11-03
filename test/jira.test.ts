@@ -185,3 +185,20 @@ describe('transitionToDone without a reachable Done status', () => {
     expect(r).toEqual({ closed: false, path: ['Waiting for customer'], available: ['Respond → Waiting for customer'] });
   });
 });
+
+describe('jira.getWatchers / addWatcherAsUser', () => {
+  it('returns watchers with their account type (apps are recognised without /myself)', async () => {
+    api.appRequest.mockResolvedValue(reply(200, { watchers: [{ accountId: 'app-1', accountType: 'app' }, { accountId: 'u1', accountType: 'atlassian' }, { displayName: 'x' }] }));
+    expect(await jira.getWatchers('10046')).toEqual([
+      { accountId: 'app-1', accountType: 'app' },
+      { accountId: 'u1', accountType: 'atlassian' },
+    ]);
+    expect(pathOf(api.appRequest.mock.calls[0]!)).toBe('/rest/api/3/issue/10046/watchers');
+  });
+  it('adds the user as watcher with the account id as a JSON string body', async () => {
+    api.userRequest.mockResolvedValue(reply(204, undefined));
+    await jira.addWatcherAsUser('PAY-52', '557058:abc');
+    expect(pathOf(api.userRequest.mock.calls[0]!)).toBe('/rest/api/3/issue/PAY-52/watchers');
+    expect((api.userRequest.mock.calls[0]![1] as { body: string }).body).toBe('"557058:abc"');
+  });
+});

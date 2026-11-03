@@ -88,7 +88,7 @@ const FIELDS: readonly [keyof MappingForm, string, string][] = [
   ['confluenceSpaceKeys', 'Confluence space keys', 'PLAT'],
   ['aliases', 'Aliases', 'payment gateway, card payments'],
   ['ownerTeamName', 'Owner team name', 'Payments'],
-  ['ownerTeamId', 'Owner team id (optional)', ''],
+  ['ownerTeamId', 'Owner team id (optional, Atlassian team id for reach)', ''],
 ];
 const list = (text: string) => text.split(',').map((v) => v.trim()).filter((v) => v !== '');
 const toForm = (m: ServiceMapping): MappingForm => ({
@@ -389,6 +389,82 @@ function TwgSpike() {
   );
 }
 
+interface StampReply {
+  pages?: number;
+  pagesAlready?: number;
+  watchers?: number;
+  failed?: string[];
+  error?: string;
+}
+
+/** Adds the admin's human touch to the demo (review note on the S1 page, watcher on three issues) so reach can be traced. */
+function StampDemo() {
+  const [running, setRunning] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const run = () => {
+    setRunning(true);
+    invoke('stampDemo')
+      .then((r) => {
+        const res = r as StampReply;
+        if (res.error) setMessage(res.error);
+        else {
+          const page = res.pages ? 'review note added to the demo page' : res.pagesAlready ? 'demo page already reviewed' : 'demo page not changed';
+          const failed = res.failed?.length ? ` Problems: ${res.failed.join('; ')}` : '';
+          setMessage(`Done: ${page}; watching ${res.watchers ?? 0} of 3 demo issues.${failed}`);
+        }
+      })
+      .catch((e: unknown) => setMessage(`Error: ${errorText(e)}`))
+      .finally(() => setRunning(false));
+  };
+  return (
+    <section style={s.section}>
+      <h2 style={s.h2}>Demo reach</h2>
+      <p style={s.muted}>
+        Reach needs people, not the app: after Load demo data, Stamp demo data adds "Reviewed by you" to the vendor page and makes you a watcher of the payment client story and the two
+        checkout tickets. Then set the owner team id of the checkout mapping to the responder team (the id in the team URL, <code>/people/team/&lt;id&gt;</code>).
+      </p>
+      <button type="button" onClick={run} disabled={running}>
+        {running ? 'Stamping…' : 'Stamp demo data'}
+      </button>
+      {message && <p style={s.muted}>{message}</p>}
+    </section>
+  );
+}
+
+/** Temporary: can this session read team membership of other accounts? Shows the raw resolver reply. */
+function TeamSpike() {
+  const [accountIds, setAccountIds] = useState('');
+  const [pageId, setPageId] = useState('');
+  const [running, setRunning] = useState(false);
+  const [output, setOutput] = useState<string>('');
+  const run = (e: FormEvent) => {
+    e.preventDefault();
+    setRunning(true);
+    const ids = accountIds
+      .split(',')
+      .map((v) => v.trim())
+      .filter((v) => v !== '');
+    invoke('teamSpike', { accountIds: ids, pageId: pageId.trim() })
+      .then((reply) => setOutput(JSON.stringify(reply, null, 2)))
+      .catch((err: unknown) => setOutput(`Error: ${errorText(err)}`))
+      .finally(() => setRunning(false));
+  };
+  return (
+    <section style={s.section}>
+      <form onSubmit={run}>
+        <div style={s.row}>
+          <input aria-label="Account ids (comma separated)" placeholder="Account ids, comma separated" value={accountIds} onChange={(e) => setAccountIds(e.target.value)} />
+          <input aria-label="Confluence page id (optional)" placeholder="Page id (optional)" value={pageId} onChange={(e) => setPageId(e.target.value)} />
+          <button type="submit" disabled={running}>
+            {running ? 'Running…' : 'Run team membership spike'}
+          </button>
+        </div>
+      </form>
+      {output && <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12, background: '#f4f5f7', padding: 12, marginTop: 12 }}>{output}</pre>}
+    </section>
+  );
+}
+
 function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   const onDemoDone = useCallback(() => setRefreshKey((k) => k + 1), []);
@@ -398,8 +474,10 @@ function App() {
       <ConnectorStatus />
       <ServiceMappings refreshKey={refreshKey} />
       <DemoData onDone={onDemoDone} />
+      <StampDemo />
       <DossierPanel />
       <TwgSpike />
+      <TeamSpike />
     </>
   );
 }

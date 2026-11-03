@@ -412,3 +412,29 @@ describe('Jira links use the site URL, not the asApp gateway self link', () => {
     expect(issueMeta(issue(1), 'https://one-atlas-vyyd.atlassian.net').base).toBe('https://one-atlas-vyyd.atlassian.net');
   });
 });
+
+describe('app authors (accountType app)', () => {
+  it('are not stored as authors but remembered, in issues, comments and Confluence content', async () => {
+    const meta = issueMeta(issue(1));
+    const { items } = commentItems(meta, [
+      { id: 'a', author: { accountId: 'app-1', accountType: 'app' }, body: adf('closing note'), created: daysAgo(3) },
+      { id: 'b', author: { accountId: 'u1', accountType: 'atlassian' }, body: adf('a person'), created: daysAgo(2) },
+    ]);
+    expect(items.map((i) => [i.event.authorAccountId, i.appAccountId])).toEqual([
+      [null, 'app-1'],
+      ['u1', undefined],
+    ]);
+    // A comment by the app still counts as another participant for "answered".
+    expect(items[0]?.isLastComment).toBe(false);
+
+    const f = fakeRepo();
+    const appIssue = issue(2, { reporter: { accountId: 'app-1', accountType: 'app' } });
+    const appPage = { ...page('501', 'TLS note', daysAgo(12)), history: { createdDate: daysAgo(12), createdBy: { accountId: 'app-2', accountType: 'app' } } };
+    const { deps } = makeDeps(f.repo, [[appIssue]], [[appPage]]);
+    const noted: string[][] = [];
+    const withNote: CollectDeps = { ...deps, noteAppAccounts: async (ids) => void noted.push([...ids]) };
+    await runCollectStep('job-1', withNote, budget(10));
+    expect(noted.flat().sort()).toEqual(['app-1', 'app-2']);
+    expect([...f.events.values()].every((e) => e.authorAccountId === null)).toBe(true);
+  });
+});

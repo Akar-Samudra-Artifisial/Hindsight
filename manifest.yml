@@ -156,21 +156,27 @@ modules:
       name: Trace signal reach
       function: trace-signal-reach-fn
       actionVerb: GET
-      description: Show who saw each confirmed signal before the incident, which teams
-        it reached and where it stopped travelling. Blameless; no individual
-        scoring.
+      description: Trace which teams each confirmed signal reached before the incident,
+        where it stopped, and the reach metrics (first signal, awareness gap,
+        reached of confirmed). Team names only, never people. Blameless.
       inputs:
         incidentKey:
           title: Incident key
           type: string
           required: true
           description: JSM incident issue key, for example INC-1.
+        signalId:
+          title: Signal ID
+          type: string
+          required: false
+          description: Optional. Trace only this confirmed signal (ID from Find prior signals).
     - key: propose-routes
       name: Propose routes
       function: propose-routes-fn
       actionVerb: GET
-      description: Propose routes that would have carried the confirmed signals to the
-        owning team earlier, with the counterfactual lead time for each route.
+      description: Propose ranked routes (each with a routeId) that would have carried
+        the confirmed signals to the responder team earlier, with the estimated
+        days saved for each route. Traces reach first when needed.
       inputs:
         incidentKey:
           title: Incident key
@@ -181,8 +187,9 @@ modules:
       name: Create route
       function: create-route-fn
       actionVerb: CREATE
-      description: Activate a proposed route so future matching signals reach the
-        target team. Requires explicit approval from the user before calling.
+      description: Activate a proposed route (routeId from Propose routes) so future
+        matching signals reach the responder team. Requires explicit approval
+        from the user before calling.
       inputs:
         incidentKey:
           title: Incident key

@@ -70,6 +70,8 @@ export interface CollectDeps {
   isRateLimited(err: unknown): boolean;
   now(): number;
   newId?: () => string;
+  /** Remembers app account ids seen as authors, so reach can drop their touches (watchers, page versions). */
+  noteAppAccounts?(ids: readonly string[]): Promise<void>;
 }
 
 export interface CollectCounts {
@@ -93,6 +95,15 @@ export interface CollectedItem {
   event: Omit<EventInput, 'id'> & { source: EventSource; commentId: string };
   text: string;
   isLastComment: boolean;
+  /** Author was an app account (`accountType: 'app'`): not stored as the author, remembered for reach. */
+  appAccountId?: string;
+}
+
+/** Author account id for storage (null for apps: their touches are not people) and the app id when it is one. */
+function authorOf(user: { accountId?: string; accountType?: string } | null | undefined): { authorAccountId: string | null; appAccountId?: string } {
+  const id = user?.accountId || null;
+  if (id && user?.accountType === 'app') return { authorAccountId: null, appAccountId: id };
+  return { authorAccountId: id };
 }
 
 export interface IssueMeta {
@@ -129,7 +140,9 @@ export function issueItem(issue: RawIssue, meta: IssueMeta): CollectedItem | und
   const f = issue.fields ?? {};
   if (!f.created) return undefined;
   const text = normaliseText(adfToText(f.description));
+  const author = authorOf(f.reporter);
   return {
+    ...(author.appAccountId ? { appAccountId: author.appAccountId } : {}),
     event: {
       source: meta.source,
       kind: 'issue',
@@ -141,7 +154,7 @@ export function issueItem(issue: RawIssue, meta: IssueMeta): CollectedItem | und
       projectKey: meta.projectKey,
       componentNames: meta.componentNames,
       labels: meta.labels,
-      authorAccountId: f.reporter?.accountId ?? null,
+      authorAccountId: author.authorAccountId,
       occurredAt: new Date(f.created).toISOString(),
       sourceUpdatedAt: f.updated ? new Date(f.updated).toISOString() : null,
       textHash: hashText(`${meta.title}\n${text}`),
@@ -177,7 +190,9 @@ export function commentItems(meta: IssueMeta, comments: readonly RawComment[], t
     // Restricted replies still count as an answer: they are only excluded from storage, not from the thread.
     const answered = ordered.slice(i + 1).some((later) => (later.author?.accountId ?? null) !== author);
     const text = normaliseText(adfToText(c.body));
+    const stored = authorOf(c.author);
     return [{
+      ...(stored.appAccountId ? { appAccountId: stored.appAccountId } : {}),
       event: {
         source: meta.source,
         kind: 'comment',
@@ -189,7 +204,7 @@ export function commentItems(meta: IssueMeta, comments: readonly RawComment[], t
         projectKey: meta.projectKey,
         componentNames: meta.componentNames,
         labels: meta.labels,
-        authorAccountId: author,
+        authorAccountId: stored.authorAccountId,
         occurredAt: new Date(String(c.created)).toISOString(),
         sourceUpdatedAt: c.updated ? new Date(c.updated).toISOString() : null,
         textHash: hashText(text),
@@ -213,7 +228,9 @@ export function confluenceItem(c: RawContent, base: string | null): CollectedIte
   if (isComment && containerId === '') return undefined;
   const text = normaliseText(storageToText(c.body?.storage?.value ?? ''));
   const title = (isComment ? c.container?.title : c.title) ?? c.title ?? '';
+  const author = authorOf(c.history?.createdBy);
   return {
+    ...(author.appAccountId ? { appAccountId: author.appAccountId } : {}),
     event: {
       source: 'confluence',
       kind: isComment ? 'comment' : 'page',
@@ -223,7 +240,7 @@ export function confluenceItem(c: RawContent, base: string | null): CollectedIte
       title,
       url: base && c._links?.webui ? `${base}${c._links.webui}` : null,
       spaceKey: c.space?.key ?? null,
-      authorAccountId: c.history?.createdBy?.accountId ?? null,
+      authorAccountId: author.authorAccountId,
       occurredAt: new Date(createdAt).toISOString(),
       sourceUpdatedAt: c.version?.when ? new Date(c.version.when).toISOString() : null,
       textHash: hashText(isComment ? text : `${title}\n${text}`),
@@ -308,6 +325,8 @@ interface Totals {
 /** Stores the in-window items of one page and keeps the ones that pass the filter. */
 async function processItems(job: AnalysisJob, scope: Scope, items: readonly CollectedItem[], deps: CollectDeps): Promise<Totals> {
   if (items.length === 0) return { scanned: 0, stored: 0, candidates: 0 };
+  const appIds = [...new Set(items.flatMap((i) => (i.appAccountId ? [i.appAccountId] : [])))];
+  if (appIds.length > 0 && deps.noteAppAccounts) await deps.noteAppAccounts(appIds);
   const existing = await deps.repo.findEventsByRefs(items.map((i) => i.event));
   const from = new Date(scope.windowFrom).getTime();
   const to = new Date(scope.windowTo).getTime();

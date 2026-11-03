@@ -48,20 +48,46 @@ export interface DossierInput {
   earliestDaysBefore: number | null;
   /** Scored signals that are not rejected; undefined before scoring finished. */
   signalCount?: number;
+  /** Reach of the confirmed signals, once traced; counts and source keys only. */
+  reach?: DossierReach;
   now: Date;
+}
+
+export interface DossierReach {
+  firstSignalDays: number;
+  awarenessGapDays: number;
+  reached: number;
+  considered: number;
+  /** `source` is the source type only ("Confluence space"), never its key: the dossier is visible to everyone. */
+  topRoute: { source: string; estimatedDaysSaved: number; maxDaysBefore: number } | null;
+}
+
+/** Metrics block: numbers and the top route's source type only (no keys, quotes, titles, people or team names). */
+export function reachText(r: DossierReach): string {
+  const parts = [
+    `First confirmed signal ${plural(r.firstSignalDays, 'day', 'days')} before the incident; awareness gap ${plural(r.awarenessGapDays, 'day', 'days')}.`,
+    `Reach: ${r.reached} of ${plural(r.considered, 'confirmed signal', 'confirmed signals')} reached the responder team before the incident.`,
+  ];
+  if (r.topRoute) {
+    parts.push(
+      `Top route: mention the responder team on matching items in a ${r.topRoute.source}, ~${Math.round(r.topRoute.estimatedDaysSaved)} days earlier (up to ${r.topRoute.maxDaysBefore}), assuming the mention is read and acted on.`,
+    );
+  }
+  return parts.join(' ');
 }
 
 export const dossierId = (incidentKey: string): string => `dossier-${incidentKey.toLowerCase()}`;
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
-export function dossierText(i: Pick<DossierInput, 'incidentKey' | 'windowDays' | 'candidateCount' | 'earliestDaysBefore' | 'signalCount'>): string {
+export function dossierText(i: Pick<DossierInput, 'incidentKey' | 'windowDays' | 'candidateCount' | 'earliestDaysBefore' | 'signalCount' | 'reach'>): string {
   const window = `in the ${i.windowDays} days before the incident`;
   if (i.signalCount !== undefined) {
     const among = `among ${plural(i.candidateCount, 'candidate', 'candidates')}`;
     if (i.signalCount === 0) return `Hindsight analysed ${i.incidentKey}: no early signals found ${among} ${window}.`;
     const earliestSignal = i.earliestDaysBefore === null ? '' : `; the earliest ${plural(i.earliestDaysBefore, 'day', 'days')} before`;
-    return `Hindsight analysed ${i.incidentKey}: ${plural(i.signalCount, 'early signal', 'early signals')} found ${among} ${window}${earliestSignal}. Open the Hindsight panel on ${i.incidentKey} to review them.`;
+    const reach = i.reach ? ` ${reachText(i.reach)}` : '';
+    return `Hindsight analysed ${i.incidentKey}: ${plural(i.signalCount, 'early signal', 'early signals')} found ${among} ${window}${earliestSignal}.${reach} Open the Hindsight panel on ${i.incidentKey} to review them.`;
   }
   if (i.candidateCount === 0) return `Hindsight analysed ${i.incidentKey}: no candidate early signals ${window}.`;
   const earliest = i.earliestDaysBefore === null ? '' : `; the earliest ${plural(i.earliestDaysBefore, 'day', 'days')} before`;

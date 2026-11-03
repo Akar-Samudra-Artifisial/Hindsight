@@ -20,7 +20,7 @@ export interface RawContent {
   type?: string;
   title?: string;
   space?: { key?: string };
-  history?: { createdDate?: string; createdBy?: { accountId?: string } };
+  history?: { createdDate?: string; createdBy?: { accountId?: string; accountType?: string } };
   version?: { when?: string; number?: number };
   body?: { storage?: { value?: string } };
   container?: { id?: string | number; title?: string; type?: string };
@@ -117,6 +117,47 @@ export const confluence = {
       }
     }
     return visible;
+  },
+
+  /**
+   * Title, version and storage body as the current user sees them; undefined on 401/403/404. Resolvers only.
+   * Throws when the storage body is missing, because writing back a body that was not returned would wipe the page.
+   */
+  async getPageAsUser(pageId: string): Promise<{ title: string; version: number; body: string } | undefined> {
+    const res = await api.asUser().requestConfluence(route`/wiki/api/v2/pages/${pageId}?body-format=storage`, { headers: { Accept: 'application/json' } });
+    if (res.status === 401 || res.status === 403 || res.status === 404) return undefined;
+    const page = await readJson<{ title: string; version: { number: number }; body?: { storage?: { value?: unknown } } }>(res, `get page ${pageId} as user`);
+    const body = page.body?.storage?.value;
+    if (typeof body !== 'string') throw new ConfluenceError(500, `Confluence get page ${pageId} as user returned no storage body`);
+    return { title: page.title, version: page.version.number, body };
+  },
+
+  /**
+   * Who saved each version of the page (newest 50), as the current user [VERIFY v2 `/pages/{id}/versions`]. Empty on
+   * 401/403/404; other failures throw a ConfluenceError (429 included). Resolvers and actions only.
+   */
+  async getPageVersionAuthorsAsUser(pageId: string): Promise<{ accountId: string; at: string | null }[]> {
+    const res = await api.asUser().requestConfluence(route`/wiki/api/v2/pages/${pageId}/versions?limit=50`, { headers: { Accept: 'application/json' } });
+    if (res.status === 401 || res.status === 403 || res.status === 404) return [];
+    const body = await readJson<{ results?: { authorId?: string; createdAt?: string }[] }>(res, `versions of page ${pageId}`);
+    return (body.results ?? []).flatMap((v) => (typeof v.authorId === 'string' && v.authorId !== '' ? [{ accountId: v.authorId, at: v.createdAt ?? null }] : []));
+  },
+
+  /** Replaces the body as the current user (they become a page contributor); returns the saved version. Resolvers only. */
+  async updatePageAsUser(pageId: string, page: { title: string; body: string; version: number; message: string }): Promise<number> {
+    const res = await api.asUser().requestConfluence(route`/wiki/api/v2/pages/${pageId}`, {
+      method: 'PUT',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({
+        id: pageId,
+        status: 'current',
+        title: page.title,
+        body: { representation: 'storage', value: page.body },
+        version: { number: page.version, message: page.message },
+      }),
+    });
+    const saved = await readJson<{ version: { number: number } }>(res, `update page ${pageId} as user`);
+    return saved.version.number;
   },
 
   // --- Demo seed --------------------------------------------------------------------------------
