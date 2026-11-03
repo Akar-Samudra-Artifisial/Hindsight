@@ -24,7 +24,7 @@ Built for Atlassian Codegeist 2026 (Apps for Software Teams). Runs on Atlassian:
 
 - **Jira Cloud** (required). Jira Service Management is optional: without it, the demo creates `INC` as a software project.
 - **Confluence Cloud** on the same site (optional, recommended): needed for page signals, the demo space and Confluence Sentinel alerts.
-- **Rovo** enabled on the site for the agent, skill and MCP.
+- **Rovo enabled on the site** for the Rovo agent, the skill and the Teamwork Graph connector. Without Rovo, the connector shows "Not available — Rovo is disabled on this site". The core issue panel (Load demo data, Analyze, Confirm, reach map, Routes, Sentinel) and the external MCP tools work without Rovo.
 - **Organization admin** to install (Teamwork Graph scopes), to connect the Teamwork Graph connector and to enable MCP tools.
 - **Jira administrator** to open the Hindsight setup page.
 
@@ -64,7 +64,7 @@ Notes: don't click **Analyze again** after confirming, because AI scoring can su
 
 ## Connect the Teamwork Graph connector
 
-Requires an organization admin.
+Requires an organization admin and Rovo enabled on the site.
 
 1. In `admin.atlassian.com`, open your organization → **Connectors** → **All connectors** → **Add connector**.
 2. Choose the category **Other**, select **Hindsight**, enter a name and click **Connect**.
@@ -99,7 +99,7 @@ Tool names carry the suffix `_development` (for example `find-prior-signals_deve
 
 ## Use the Rovo agent
 
-Open Rovo from an incident, choose **Hindsight Investigator**, and ask, for example:
+Requires Rovo enabled on the site. Open Rovo from an incident, choose **Hindsight Investigator**, and ask, for example:
 
 - *"Did we have early signals before INC-15?"*
 - *"Trace how far the early signals for INC-15 reached."*
