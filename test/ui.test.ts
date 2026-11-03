@@ -131,6 +131,20 @@ describe('setup resolvers', () => {
     repoMock.getLatestCollectedJobForIncident.mockResolvedValue(undefined);
     expect(await call('writeTestDossier')).toEqual({ error: 'No finished analysis of INC-1 yet. Open INC-1, click Analyze and wait until the candidates appear.' });
   });
+
+  it('logs every refused, setting-up or failed reply with the resolver name', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    repoMock.listDemoArtifacts.mockResolvedValue([]);
+    await call('writeTestDossier');
+    expect(warn).toHaveBeenCalledWith('resolver refused', { resolver: 'writeTestDossier', error: 'There is no demo incident yet. Click Load demo data first.' });
+    jiraMock.getIncidentAsUser.mockReset().mockResolvedValue(undefined);
+    await call('startAnalysis', { incidentKey: 'INC-1' }, { accountId: 'acc-1' });
+    expect(warn).toHaveBeenCalledWith('resolver refused', { resolver: 'startAnalysis', error: 'Incident INC-1 was not found, or you do not have permission to view it.' });
+    jiraMock.getIncidentAsUser.mockRejectedValue(new Error('Jira 500'));
+    await expect(call('startAnalysis', { incidentKey: 'INC-1' }, { accountId: 'acc-1' })).rejects.toThrow('Jira 500');
+    expect(error).toHaveBeenCalledWith('resolver failed', { resolver: 'startAnalysis', error: 'Error: Jira 500' });
+  });
 });
 
 describe('getDemoJob', () => {

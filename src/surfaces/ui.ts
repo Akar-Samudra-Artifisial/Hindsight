@@ -42,6 +42,29 @@ const SURFACES = new Set(['incident', 'insights', 'setup']);
 
 const resolver = new Resolver();
 
+type ResolverCallback = Parameters<Resolver['define']>[1];
+
+/**
+ * `resolver.define` with a log for every reply that does not do the work: `{ error }` (refused input), `ready: false`
+ * (schema setting up) and thrown errors. Without it a refused Analyze or Write test dossier leaves no trace in the logs.
+ */
+function define(name: string, run: ResolverCallback): void {
+  resolver.define(name, async (req) => {
+    try {
+      const out: unknown = await run(req);
+      if (out && typeof out === 'object') {
+        const reply = out as { error?: unknown; ready?: unknown; applied?: unknown; total?: unknown };
+        if (typeof reply.error === 'string') console.warn('resolver refused', { resolver: name, error: reply.error.slice(0, 300) });
+        else if (reply.ready === false) console.info('resolver setting up', { resolver: name, applied: reply.applied, total: reply.total });
+      }
+      return out as Awaited<ReturnType<ResolverCallback>>;
+    } catch (err) {
+      console.error('resolver failed', { resolver: name, error: (err instanceof Error ? `${err.name}: ${err.message}` : String(err)).slice(0, 300) });
+      throw err;
+    }
+  });
+}
+
 interface SchemaReply {
   ready: boolean;
   applied: number;
@@ -59,7 +82,7 @@ async function schemaReply(): Promise<SchemaReply> {
   }
 }
 
-resolver.define('getStatus', async ({ payload }) => {
+define('getStatus', async ({ payload }) => {
   const surface = typeof payload['surface'] === 'string' ? payload['surface'] : '';
   if (!SURFACES.has(surface)) return { error: `Unknown surface "${surface}".` };
   return { surface, ...(await schemaReply()) };
@@ -105,7 +128,7 @@ async function requireSetupAdmin(ctx: ResolverContext, what: string): Promise<st
 }
 
 /** Starts (or returns the running) analysis of the incident, as the current user. */
-resolver.define('startAnalysis', async ({ payload, context }) =>
+define('startAnalysis', async ({ payload, context }) =>
   guarded(async () => {
     const ctx = context as ResolverContext;
     const incidentKey = incidentKeyOf(payload, ctx);
@@ -147,7 +170,7 @@ const accessDeps = { visibleIssueIds: (ids: readonly string[]) => jira.visibleIs
  * Latest analysis of the incident: job (with scoring progress), funnel (scanned → stored → candidates), the signals
  * the current user can see (others only counted in `hiddenCount`) and how many candidates failed scoring.
  */
-resolver.define('getAnalysis', async ({ payload, context }) =>
+define('getAnalysis', async ({ payload, context }) =>
   guarded(async () => {
     const ctx = context as ResolverContext;
     const incidentKey = incidentKeyOf(payload, ctx);
@@ -176,7 +199,7 @@ resolver.define('getAnalysis', async ({ payload, context }) =>
 );
 
 /** Confirm / reject / undo a signal from the incident panel, as the current user (same rules as `confirm-signal`). */
-resolver.define('decideSignal', async ({ payload, context }) =>
+define('decideSignal', async ({ payload, context }) =>
   guarded(async () => {
     const ctx = context as ResolverContext;
     const incidentKey = incidentKeyOf(payload, ctx);
@@ -196,7 +219,7 @@ resolver.define('decideSignal', async ({ payload, context }) =>
 const contextCloudId = (ctx: ResolverContext): string | undefined => ctx.cloudId || cloudIdFromInstallContext(ctx.installContext);
 
 /** Traces the confirmed signals (or one `signalId`) as the current user and recomputes the routes. */
-resolver.define('traceReach', async ({ payload, context }) =>
+define('traceReach', async ({ payload, context }) =>
   guarded(async () => {
     const ctx = context as ResolverContext;
     const incidentKey = incidentKeyOf(payload, ctx);
@@ -210,7 +233,7 @@ resolver.define('traceReach', async ({ payload, context }) =>
  * Route decision as the current user: approve a proposed route (→ active, the default), pause an active one
  * (`status: 'paused'`) or resume a paused one (`status: 'active'`).
  */
-resolver.define('decideRoute', async ({ payload, context }) =>
+define('decideRoute', async ({ payload, context }) =>
   guarded(async () => {
     const ctx = context as ResolverContext;
     const routeId = parseRouteId(payload['routeId']);
@@ -270,7 +293,7 @@ async function alertViews(alerts: readonly Alert[]): Promise<AlertView[]> {
 }
 
 /** Sentinel alerts of the incident's routes: per route the number posted and the latest alert. */
-resolver.define('getSentinelAlerts', async ({ payload, context }) =>
+define('getSentinelAlerts', async ({ payload, context }) =>
   guarded(async () => {
     const ctx = context as ResolverContext;
     const incidentKey = incidentKeyOf(payload, ctx);
@@ -289,7 +312,7 @@ resolver.define('getSentinelAlerts', async ({ payload, context }) =>
 );
 
 /** Useful / Not useful on a posted alert, as a user who can view the alert's incident. */
-resolver.define('alertFeedback', async ({ payload, context }) =>
+define('alertFeedback', async ({ payload, context }) =>
   guarded(async () => {
     const ctx = context as ResolverContext;
     const alertId = parseAlertId(payload['alertId']);
@@ -318,7 +341,7 @@ const NOTICE_SLOT = /^notice:([0-9]{1,6})$/;
  * marked self-generated; when the product event did arrive, the copy finds that artifact's retry chain running and
  * is skipped (`chain_active`), and the lifetime dedup still allows only one alert.
  */
-resolver.define('postProviderNotice', async ({ context }) =>
+define('postProviderNotice', async ({ context }) =>
   guarded(async () => {
     await requireSetupAdmin(context as ResolverContext, 'postProviderNotice');
     await ensureSchema();
@@ -340,7 +363,7 @@ resolver.define('postProviderNotice', async ({ context }) =>
   }),
 );
 
-resolver.define('getSentinelSettings', async ({ context }) =>
+define('getSentinelSettings', async ({ context }) =>
   guarded(async () => {
     await requireSetupAdmin(context as ResolverContext, 'getSentinelSettings');
     await ensureSchema();
@@ -348,7 +371,7 @@ resolver.define('getSentinelSettings', async ({ context }) =>
   }),
 );
 
-resolver.define('saveSentinelSettings', async ({ payload, context }) =>
+define('saveSentinelSettings', async ({ payload, context }) =>
   guarded(async () => {
     await requireSetupAdmin(context as ResolverContext, 'saveSentinelSettings');
     const weeklyCap = parseWeeklyCapInput(payload['weeklyCap'], MAX_WEEKLY_CAP);
@@ -363,7 +386,7 @@ resolver.define('saveSentinelSettings', async ({ payload, context }) =>
  * Setup, admin only: "Reviewed by" note on the S1 demo page and the admin as watcher of the PAY story and the two S2
  * tickets, as the admin, so Teamwork Graph has a human touch on the demo artifacts. Idempotent.
  */
-resolver.define('stampDemo', async ({ context }) =>
+define('stampDemo', async ({ context }) =>
   guarded(async () => {
     const accountId = await requireSetupAdmin(context as ResolverContext, 'stampDemo');
     await ensureSchema();
@@ -380,7 +403,7 @@ resolver.define('stampDemo', async ({ context }) =>
 );
 
 /** Teamwork Graph connector status for the setup page; never returns the connectionId. */
-resolver.define('getGraphConnection', async ({ context }) => {
+define('getGraphConnection', async ({ context }) => {
   const ctx = context as ResolverContext;
   if (ctx.moduleKey !== SETUP_MODULE) return { error: 'getGraphConnection is only available on Hindsight setup.' };
   const schema = await schemaReply();
@@ -390,7 +413,7 @@ resolver.define('getGraphConnection', async ({ context }) => {
 });
 
 /** Teamwork Graph read spike, as the current user; setup page only. */
-resolver.define('twgSpike', async ({ context }) => {
+define('twgSpike', async ({ context }) => {
   const ctx = context as ResolverContext;
   if (ctx.moduleKey !== SETUP_MODULE) return { error: 'twgSpike is only available on Hindsight setup.' };
   if (!ctx.accountId) return { error: 'No user in context.' };
@@ -426,7 +449,7 @@ function parseSpikePageId(value: unknown): string | null {
  * current user plus the given ids (and, optionally, up to 5 contributors of a page). Admin only; replies and logs
  * carry shortened account ids only.
  */
-resolver.define('teamSpike', async ({ payload, context }) =>
+define('teamSpike', async ({ payload, context }) =>
   guarded(async () => {
     const ctx = context as ResolverContext;
     const self = await requireSetupAdmin(ctx, 'teamSpike');
@@ -469,7 +492,7 @@ resolver.define('teamSpike', async ({ payload, context }) =>
 
 // --- Service mappings (setup, admin only) ---------------------------------------------------------
 
-resolver.define('listServiceMappings', async ({ context }) =>
+define('listServiceMappings', async ({ context }) =>
   guarded(async () => {
     await requireSetupAdmin(context as ResolverContext, 'listServiceMappings');
     await ensureSchema();
@@ -477,7 +500,7 @@ resolver.define('listServiceMappings', async ({ context }) =>
   }),
 );
 
-resolver.define('saveServiceMapping', async ({ payload, context }) =>
+define('saveServiceMapping', async ({ payload, context }) =>
   guarded(async () => {
     await requireSetupAdmin(context as ResolverContext, 'saveServiceMapping');
     const mapping = parseServiceMapping(payload['mapping']);
@@ -492,7 +515,7 @@ resolver.define('saveServiceMapping', async ({ payload, context }) =>
   }),
 );
 
-resolver.define('deleteServiceMapping', async ({ payload, context }) =>
+define('deleteServiceMapping', async ({ payload, context }) =>
   guarded(async () => {
     await requireSetupAdmin(context as ResolverContext, 'deleteServiceMapping');
     const serviceKey = parseServiceKey(payload['serviceKey']);
@@ -510,7 +533,7 @@ async function demoIncidentKey(): Promise<string | null> {
   return artifacts.find((a) => a.slot === INCIDENT_SLOT)?.artifactKey ?? null;
 }
 
-resolver.define('startDemoJob', async ({ payload, context }) =>
+define('startDemoJob', async ({ payload, context }) =>
   guarded(async () => {
     const accountId = await requireSetupAdmin(context as ResolverContext, 'startDemoJob');
     const kind = parseDemoKind(payload['kind']);
@@ -528,7 +551,7 @@ resolver.define('startDemoJob', async ({ payload, context }) =>
   }),
 );
 
-resolver.define('getDemoJob', async ({ context }) =>
+define('getDemoJob', async ({ context }) =>
   guarded(async () => {
     await requireSetupAdmin(context as ResolverContext, 'getDemoJob');
     await ensureSchema();
@@ -552,7 +575,7 @@ resolver.define('getDemoJob', async ({ context }) =>
 // --- Teamwork Graph dossier (setup, admin only) ----------------------------------------------------
 
 /** Queues a `score` run for the demo incident's latest analysis; the consumer writes the dossier (never the resolver). */
-resolver.define('writeTestDossier', async ({ context }) =>
+define('writeTestDossier', async ({ context }) =>
   guarded(async () => {
     await requireSetupAdmin(context as ResolverContext, 'writeTestDossier');
     await ensureSchema();
@@ -566,7 +589,7 @@ resolver.define('writeTestDossier', async ({ context }) =>
   }),
 );
 
-resolver.define('getDossierStatus', async ({ context }) =>
+define('getDossierStatus', async ({ context }) =>
   guarded(async () => {
     await requireSetupAdmin(context as ResolverContext, 'getDossierStatus');
     await ensureSchema();

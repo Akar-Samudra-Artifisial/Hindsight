@@ -58,6 +58,7 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), dan p
 
 ### Fixed
 
+- "Analyze again" di panel insiden yang ditolak (mis. insiden tidak terlihat) tidak lagi diam: pesan alasannya tetap tampil, tidak langsung terhapus oleh reload panel. Setiap resolver UI yang menolak (`resolver refused`), menunggu database (`resolver setting up`), atau gagal (`resolver failed`) kini menulis log beserta nama resolver, sehingga klik Analyze/Write test dossier yang tidak mengantre job bisa dilacak di `forge logs`.
 - Ikon sumber "Hindsight signals" (connector Teamwork Graph) rusak di Rovo Search: `graph:connector` kini memakai URL https PNG 256×256 (`docs/assets/connector-icon-light.png`, `connector-icon-dark.png`) sesuai contoh dokumentasi, bukan `resource:` SVG.
 - Load demo data di production gagal sebelum langkah 1 dengan `SyntaxError: Unexpected non-whitespace character after JSON at position 4`: Forge SQL mengembalikan setting string `demo_t0` (kolom JSON) tanpa tanda kutip, lalu `parseJsonColumn` mem-parse `2026-…`. Kolom JSON yang bukan JSON valid kini dipakai apa adanya. Respons 2xx Jira/Confluence yang bukan JSON kini gagal dengan pesan yang menyebut endpoint, dan log kegagalan job demo menyertakan stack.
 - Halaman setup tidak lagi menampilkan "Project … was created by Hindsight" untuk project/space demo yang sudah dihapus. Di antara job, `getDemoJob` mengecek keberadaan container dan menampilkan "… no longer exists; Load demo data will create it again."; insiden demo di INC yang terhapus tidak ditautkan lagi.
