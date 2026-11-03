@@ -328,6 +328,23 @@ export interface SignalDecisionInput {
   reason?: string | null;
 }
 
+/** One cached LLM verdict for a candidate's text (demo incident only). */
+export interface CachedScore {
+  relevant: boolean;
+  signalType: SignalType | null;
+  quote: string;
+  reason: string;
+  confidence: number;
+  model: string;
+}
+
+export interface ScoreCacheInput extends CachedScore {
+  incidentKey: string;
+  eventId: string;
+  textHash: string;
+  promptVersion: string;
+}
+
 export type GraphState = 'ok' | 'unknown' | 'pending';
 export type ReachVia = 'resolver' | 'action' | 'mcp';
 
@@ -515,8 +532,10 @@ const REACH_COLS =
 const REACH_REFRESH_COLS = ['incident_key', 'reached', 'hop_count', 'steps_json', 'stop_point_json', 'graph_state', 'responder_team_id', 'via'] as const;
 const ROUTE_COLS =
   'id, origin_incident_key, source_type, source_key, spec_json, reason, estimated_days_saved, max_days_before, signal_ids, score, status, rank_no, activated_at, created_at, updated_at';
-/** Columns a recompute refreshes; an active route keeps all of them (and its status is never touched). */
-const ROUTE_REFRESH_COLS = ['spec_json', 'reason', 'estimated_days_saved', 'max_days_before', 'signal_ids', 'score', 'rank_no'] as const;
+/** Explanation columns a recompute always refreshes, also on an active route (the latest trace explains it best). */
+const ROUTE_EXPLAIN_COLS = ['reason', 'estimated_days_saved', 'max_days_before', 'signal_ids', 'score'] as const;
+/** What a person approved (the rule itself) and its rank: frozen once a route is active. */
+const ROUTE_FROZEN_WHEN_ACTIVE_COLS = ['spec_json', 'rank_no'] as const;
 export const MAX_REACH_PATHS = 500;
 export const MAX_ROUTES = 50;
 export const MAX_EVENT_TOUCHES = 2000;
@@ -972,6 +991,7 @@ export const repo = {
    * (one statement per table). Used by Reset / Remove demo data, so confirmed and rejected decisions go too.
    */
   async deleteJobsForIncident(incidentKey: string): Promise<number> {
+    await execute('DELETE FROM score_cache WHERE incident_key = ?', incidentKey);
     await execute('DELETE FROM reach_paths WHERE incident_key = ?', incidentKey);
     await execute('DELETE FROM routes WHERE origin_incident_key = ?', incidentKey);
     await execute('DELETE FROM signal_decisions WHERE incident_key = ?', incidentKey);
@@ -1278,6 +1298,57 @@ export const repo = {
     );
   },
 
+  // Score cache (demo incident only)
+  /** Cached verdicts of the incident for these events under `promptVersion`, keyed `eventId|textHash`. */
+  async getScoreCache(incidentKey: string, promptVersion: string, eventIds: readonly string[]): Promise<Map<string, CachedScore>> {
+    const out = new Map<string, CachedScore>();
+    for (const batch of chunk([...new Set(eventIds)], 100)) {
+      const rows = await query<Row>(
+        `SELECT event_id, text_hash, relevant, signal_type, quote, reason, confidence, model FROM score_cache
+         WHERE incident_key = ? AND prompt_version = ? AND event_id IN (${placeholders(batch.length)})`,
+        incidentKey,
+        promptVersion,
+        ...batch,
+      );
+      for (const r of rows) {
+        out.set(`${String(r.event_id)}|${String(r.text_hash)}`, {
+          relevant: int(r.relevant) === 1,
+          signalType: r.signal_type === null || r.signal_type === undefined ? null : (String(r.signal_type) as SignalType),
+          quote: String(r.quote ?? ''),
+          reason: String(r.reason ?? ''),
+          confidence: Number(r.confidence ?? 0),
+          model: String(r.model ?? ''),
+        });
+      }
+    }
+    return out;
+  },
+
+  /** Stores verdicts; an existing verdict for the same key is kept (the first answer stays locked). */
+  async putScoreCache(rows: readonly ScoreCacheInput[]): Promise<number> {
+    let affected = 0;
+    const rowPlaceholder = `(${placeholders(10)})`;
+    for (const batch of chunk(rows, BATCH_ROWS)) {
+      affected += await execute(
+        `INSERT INTO score_cache (incident_key, event_id, text_hash, prompt_version, relevant, signal_type, quote, reason, confidence, model)
+         VALUES ${batch.map(() => rowPlaceholder).join(', ')} ON DUPLICATE KEY UPDATE incident_key = incident_key`,
+        ...batch.flatMap((r) => [
+          r.incidentKey,
+          r.eventId,
+          r.textHash,
+          r.promptVersion.slice(0, 32),
+          r.relevant ? 1 : 0,
+          r.signalType,
+          r.quote,
+          r.reason.slice(0, 255),
+          Math.min(1, Math.max(0, r.confidence)),
+          r.model.slice(0, 64),
+        ]),
+      );
+    }
+    return affected;
+  },
+
   /** Kept candidates by id (for their matched keywords). */
   async getCandidatesByIds(ids: readonly string[]): Promise<Candidate[]> {
     const out: Candidate[] = [];
@@ -1359,11 +1430,15 @@ export const repo = {
 
   // Routes
   /**
-   * Inserts routes on `(origin_incident_key, source_type, source_key)`. A duplicate is refreshed unless it is
-   * `active`; the status itself is never updated here, so a recompute cannot demote an approved route.
+   * Inserts routes on `(origin_incident_key, source_type, source_key)`. A duplicate always gets the latest reason,
+   * estimate, signal ids and score; an `active` one keeps its approved rule (`spec_json`) and rank. Status,
+   * `decided_by` and `activated_at` are never updated here, so a recompute cannot demote an approved route.
    */
   async upsertRoutes(routes: readonly RouteInput[]): Promise<number> {
-    const updates = ROUTE_REFRESH_COLS.map((c) => `${c} = IF(status = 'active', ${c}, VALUES(${c}))`).join(', ');
+    const updates = [
+      ...ROUTE_EXPLAIN_COLS.map((c) => `${c} = VALUES(${c})`),
+      ...ROUTE_FROZEN_WHEN_ACTIVE_COLS.map((c) => `${c} = IF(status = 'active', ${c}, VALUES(${c}))`),
+    ].join(', ');
     const rowPlaceholder = `(${placeholders(13)})`;
     let affected = 0;
     for (const batch of chunk(routes, BATCH_ROWS)) {

@@ -45,7 +45,7 @@ function columnNames(statement: string): string[] {
 }
 
 describe('MIGRATIONS', () => {
-  it('has v001–v014, unique names in order', () => {
+  it('has v001–v015, unique names in order', () => {
     const names = MIGRATIONS.map((m) => m.name);
     expect(new Set(names).size).toBe(names.length);
     expect(names).toEqual([
@@ -63,8 +63,15 @@ describe('MIGRATIONS', () => {
       'v012_add_signal_candidates_score_error',
       'v013_create_reach_paths',
       'v014_create_routes',
+      'v015_create_score_cache',
     ]);
-    expect(LATEST_MIGRATION).toBe('v014_create_routes');
+    expect(LATEST_MIGRATION).toBe('v015_create_score_cache');
+  });
+
+  it('score_cache is keyed by incident, event, text hash and prompt version', () => {
+    const cache = MIGRATIONS.find((m) => m.name === 'v015_create_score_cache')!.statement;
+    expect(cache).toContain('PRIMARY KEY (incident_key, event_id, text_hash, prompt_version)');
+    expect(cache).toContain('relevant TINYINT NOT NULL');
   });
 
   it('reach_paths has one row per signal; routes are unique per origin + source and index the status', () => {

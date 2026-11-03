@@ -2,7 +2,9 @@ import type { Message } from '@forge/llm';
 import {
   SIGNAL_TYPES,
   type AnalysisJob,
+  type CachedScore,
   type Candidate,
+  type ScoreCacheInput,
   type Incident,
   type JobPatch,
   type ScoreError,
@@ -219,6 +221,42 @@ export interface ScoreDeps {
   callModel(model: string, messages: Message[]): Promise<unknown>;
   isRateLimited(err: unknown): boolean;
   now(): number;
+  /**
+   * Verdict cache of the incident, or null when it must not be used (only the demo incident has one, so its
+   * recordings stay stable; every other incident always asks the model).
+   */
+  scoreCacheFor?(incidentKey: string): Promise<ScoreCache | null>;
+}
+
+export interface ScoreCache {
+  /** Cached verdicts keyed `eventId|textHash`. */
+  get(promptVersion: string, eventIds: readonly string[]): Promise<Map<string, CachedScore>>;
+  put(rows: readonly ScoreCacheInput[]): Promise<number>;
+}
+
+const cacheKey = (c: Pick<Candidate, 'eventId' | 'textHash'>): string | null => (c.textHash ? `${c.eventId}|${c.textHash}` : null);
+
+/** Applies cached verdicts (grouped by the model that gave them, so each signal keeps its model). */
+function applyCached(candidates: readonly Candidate[], cached: ReadonlyMap<string, CachedScore>, promptVersion: string): Applied {
+  const byModel = new Map<string, Candidate[]>();
+  for (const c of candidates) {
+    const model = cached.get(cacheKey(c) ?? '')?.model ?? '';
+    byModel.set(model, [...(byModel.get(model) ?? []), c]);
+  }
+  const total: Applied = { signals: [], scored: [], failed: [], missing: [] };
+  for (const [model, group] of byModel) {
+    const results = new Map<string, ScoreResult>();
+    for (const c of group) {
+      const v = cached.get(cacheKey(c) ?? '');
+      if (v) results.set(c.id, { candidateId: c.id, relevant: v.relevant, signalType: v.signalType, quote: v.quote, reason: v.reason, confidence: v.confidence });
+    }
+    const a = applyScores(group, results, { model, promptVersion });
+    total.signals.push(...a.signals);
+    total.scored.push(...a.scored);
+    total.failed.push(...a.failed);
+    total.missing.push(...a.missing);
+  }
+  return total;
 }
 
 export type ScoreRunResult =
@@ -271,11 +309,26 @@ export async function runScoring(jobId: string, deps: ScoreDeps, opts: { deadlin
     failed: failedCount,
   };
   const save = () => deps.repo.updateJob(jobId, { progress: { ...baseProgress, score: { ...progress } } });
+  const cache = deps.scoreCacheFor ? await deps.scoreCacheFor(job.incidentKey) : null;
+  const cacheStats = { hits: 0, misses: 0 };
+  const logCache = () => {
+    if (cache) console.info('score cache', { jobId, incidentKey: job.incidentKey, ...cacheStats });
+  };
+  /** Stores signals and candidate outcomes of one applied result set. */
+  const persist = async (applied: Applied): Promise<{ signals: number; failed: number }> => {
+    if (applied.signals.length > 0) await deps.repo.upsertSignals(applied.signals);
+    if (applied.scored.length > 0) await deps.repo.markCandidates(jobId, applied.scored, 'scored', null);
+    const notFound = applied.failed.map((f) => f.id);
+    if (notFound.length > 0) await deps.repo.markCandidates(jobId, notFound, 'score_failed', 'quote_not_found');
+    progress.done += applied.scored.length + notFound.length;
+    return { signals: applied.signals.length, failed: notFound.length };
+  };
 
   while (deps.now() < opts.deadline) {
     const batch = await deps.repo.listKeptCandidates(jobId, batchSize);
     if (batch.length === 0) {
       await save();
+      logCache();
       return { status: 'done', progress, job };
     }
     const skip = batch.filter((c) => decided.has(c.eventId)).map((c) => c.id);
@@ -284,9 +337,26 @@ export async function runScoring(jobId: string, deps: ScoreDeps, opts: { deadlin
       progress.done += skip.length;
     }
     let pending = batch.filter((c) => !decided.has(c.eventId));
-    const events = new Map((await deps.repo.getEventsByIds(pending.map((c) => c.eventId))).map((e) => [e.id, e]));
     let batchSignals = 0;
     let batchFailed = 0;
+    if (cache && pending.length > 0) {
+      // Replay earlier verdicts for the same text; only new or changed candidates go to the model.
+      const cached = await cache.get(promptVersion, pending.map((c) => c.eventId));
+      const hits = pending.filter((c) => {
+        const key = cacheKey(c);
+        return key !== null && cached.has(key);
+      });
+      if (hits.length > 0) {
+        const out = await persist(applyCached(hits, cached, promptVersion));
+        batchSignals += out.signals;
+        batchFailed += out.failed;
+        const hitIds = new Set(hits.map((c) => c.id));
+        pending = pending.filter((c) => !hitIds.has(c.id));
+      }
+      cacheStats.hits += hits.length;
+      cacheStats.misses += pending.length;
+    }
+    const events = new Map((pending.length > 0 ? await deps.repo.getEventsByIds(pending.map((c) => c.eventId)) : []).map((e) => [e.id, e]));
     for (let attempt = 0; attempt < 2 && pending.length > 0; attempt += 1) {
       const message = buildScoreMessage(
         subject,
@@ -301,10 +371,13 @@ export async function runScoring(jobId: string, deps: ScoreDeps, opts: { deadlin
           { role: 'system', content: SCORE_SYSTEM },
           { role: 'user', content: message },
         ]);
-        applied = applyScores(pending, parseScoreOutput(args, new Set(pending.map((c) => c.id))), { model, promptVersion });
+        const parsed = parseScoreOutput(args, new Set(pending.map((c) => c.id)));
+        applied = applyScores(pending, parsed, { model, promptVersion });
+        if (cache) await cache.put(cacheRows(pending, parsed, { incidentKey: job.incidentKey, model, promptVersion }));
       } catch (err) {
         if (deps.isRateLimited(err)) {
           await save();
+          logCache();
           return { status: 'rate_limited', progress };
         }
         if (err instanceof LlmOutputError) {
@@ -313,13 +386,9 @@ export async function runScoring(jobId: string, deps: ScoreDeps, opts: { deadlin
         }
         throw err;
       }
-      if (applied.signals.length > 0) await deps.repo.upsertSignals(applied.signals);
-      if (applied.scored.length > 0) await deps.repo.markCandidates(jobId, applied.scored, 'scored', null);
-      const notFound = applied.failed.map((f) => f.id);
-      if (notFound.length > 0) await deps.repo.markCandidates(jobId, notFound, 'score_failed', 'quote_not_found');
-      batchSignals += applied.signals.length;
-      batchFailed += notFound.length;
-      progress.done += applied.scored.length + notFound.length;
+      const out = await persist(applied);
+      batchSignals += out.signals;
+      batchFailed += out.failed;
       pending = applied.missing;
     }
     if (pending.length > 0) {
@@ -337,5 +406,15 @@ export async function runScoring(jobId: string, deps: ScoreDeps, opts: { deadlin
     await save();
     console.info('score batch', { jobId, size: batch.length, signals: batchSignals, failed: batchFailed, done: progress.done, total: progress.total });
   }
+  logCache();
   return { status: 'more', progress };
+}
+
+/** Cache rows for every candidate the model gave a valid verdict on (relevant or not); no text hash → not cached. */
+export function cacheRows(candidates: readonly Candidate[], parsed: ReadonlyMap<string, ScoreResult>, ctx: { incidentKey: string; model: string; promptVersion: string }): ScoreCacheInput[] {
+  return candidates.flatMap((c) => {
+    const r = parsed.get(c.id);
+    if (!r || !c.textHash) return [];
+    return [{ incidentKey: ctx.incidentKey, eventId: c.eventId, textHash: c.textHash, promptVersion: ctx.promptVersion, relevant: r.relevant, signalType: r.signalType, quote: r.quote, reason: r.reason, confidence: r.confidence, model: ctx.model }];
+  });
 }

@@ -22,6 +22,8 @@ const repoMock = vi.hoisted(() => ({
   deleteStaleProposedSignals: vi.fn(),
   listReachPaths: vi.fn(async () => []),
   listRoutes: vi.fn(async () => []),
+  getScoreCache: vi.fn(async (): Promise<Map<string, unknown>> => new Map()),
+  putScoreCache: vi.fn(async (_rows: unknown[]) => 0),
 }));
 const llm = vi.hoisted(() => ({ pickModels: vi.fn(), chatTool: vi.fn() }));
 vi.mock('@forge/llm', () => ({ chat: vi.fn(), list: vi.fn() }));
@@ -355,6 +357,50 @@ describe('scoreCandidates (LLM scoring)', () => {
     const logged = JSON.stringify([(console.info as unknown as { mock: { calls: unknown[] } }).mock.calls, (console.warn as unknown as { mock: { calls: unknown[] } }).mock.calls]);
     expect(logged).not.toContain('flood');
     expect(repoMock.releaseAppLock).toHaveBeenCalledWith(`job:${JOB}`);
+  });
+
+  it('demo incident: first run asks the model and caches every verdict, relevant or not', async () => {
+    repoMock.putScoreCache.mockClear();
+    repoMock.getScoreCache.mockClear();
+    await scoreCandidates({ body: { jobId: JOB } });
+    expect(repoMock.getScoreCache).toHaveBeenCalledWith('INC-7', 'score-v2', ['e-c1', 'e-c2', 'e-c3']);
+    const rows = repoMock.putScoreCache.mock.calls[0]![0] as { eventId: string; relevant: boolean; textHash: string; promptVersion: string; model: string }[];
+    expect(rows.map((r) => [r.eventId, r.relevant])).toEqual([
+      ['e-c1', true],
+      ['e-c2', false],
+      ['e-c3', true],
+    ]);
+    expect(rows[0]).toMatchObject({ textHash: 'h', promptVersion: 'score-v2', model: 'claude-haiku-4-5-20251001' });
+    expect(console.info).toHaveBeenCalledWith('score cache', { jobId: JOB, incidentKey: 'INC-7', hits: 0, misses: 3 });
+  });
+
+  it('demo incident: Analyze again replays cached verdicts without calling the model', async () => {
+    const verdict = (relevant: boolean, quote = '', confidence = 0) => ({ relevant, signalType: relevant ? 'technical_warning' : null, quote, reason: relevant ? 'Names the retry risk.' : '', confidence, model: 'claude-haiku-4-5-20251001' });
+    repoMock.getScoreCache.mockResolvedValueOnce(
+      new Map([
+        ['e-c1|h', verdict(true, 'This retry loop could flood it with requests.', 0.9)],
+        ['e-c2|h', verdict(false)],
+        ['e-c3|h', verdict(false)],
+      ]),
+    );
+    repoMock.putScoreCache.mockClear();
+    await scoreCandidates({ body: { jobId: JOB } });
+    expect(llm.chatTool).not.toHaveBeenCalled();
+    expect(repoMock.putScoreCache).not.toHaveBeenCalled();
+    expect(repoMock.upsertSignals).toHaveBeenCalledWith([expect.objectContaining({ candidateId: 'c1', confidence: 0.9, model: 'claude-haiku-4-5-20251001' })]);
+    expect(repoMock.markCandidates).toHaveBeenCalledWith(JOB, ['c1', 'c2', 'c3'], 'scored', null);
+    expect(console.info).toHaveBeenCalledWith('score cache', { jobId: JOB, incidentKey: 'INC-7', hits: 3, misses: 0 });
+  });
+
+  it('non-demo incident never uses the cache', async () => {
+    repoMock.listDemoArtifacts.mockResolvedValue([]);
+    repoMock.getScoreCache.mockClear();
+    repoMock.putScoreCache.mockClear();
+    await scoreCandidates({ body: { jobId: JOB } });
+    expect(llm.chatTool).toHaveBeenCalled();
+    expect(repoMock.getScoreCache).not.toHaveBeenCalled();
+    expect(repoMock.putScoreCache).not.toHaveBeenCalled();
+    expect(console.info).not.toHaveBeenCalledWith('score cache', expect.anything());
   });
 
   it('stores the verbatim span of the excerpt as the quote, not the model rendering', async () => {

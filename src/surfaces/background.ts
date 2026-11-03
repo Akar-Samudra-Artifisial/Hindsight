@@ -272,9 +272,14 @@ export async function collectEvents(event: QueueEvent | undefined): Promise<Invo
  * The dossier is visible to everyone on the site, so it is only written for the demo incident, unless the admin
  * opted in with `settings.dossier_all_incidents = true`.
  */
-async function dossierAllowed(incidentKey: string): Promise<{ allowed: boolean; demo: boolean }> {
+/** True for the incident created by Load demo data (same test as the dossier gate). */
+async function isDemoIncident(incidentKey: string): Promise<boolean> {
   const artifacts = await repo.listDemoArtifacts();
-  const demo = artifacts.some((a) => a.slot === INCIDENT_SLOT && a.artifactKey === incidentKey);
+  return artifacts.some((a) => a.slot === INCIDENT_SLOT && a.artifactKey === incidentKey);
+}
+
+async function dossierAllowed(incidentKey: string): Promise<{ allowed: boolean; demo: boolean }> {
+  const demo = await isDemoIncident(incidentKey);
   if (demo) return { allowed: true, demo };
   return { allowed: (await repo.getSetting<unknown>(DOSSIER_ALL_INCIDENTS_KEY)) === true, demo };
 }
@@ -368,6 +373,11 @@ const scoreDeps: ScoreDeps = {
   callModel: (model, messages) => chatTool(model, messages, SCORE_TOOL),
   isRateLimited: isLlmRateLimited,
   now: Date.now,
+  // Demo incident only: replay earlier verdicts so "Analyze again" gives the same signals while recording.
+  scoreCacheFor: async (incidentKey) =>
+    (await isDemoIncident(incidentKey))
+      ? { get: (promptVersion, eventIds) => repo.getScoreCache(incidentKey, promptVersion, eventIds), put: (rows) => repo.putScoreCache(rows) }
+      : null,
 };
 
 /**
