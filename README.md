@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hindsight-logo-wordmark-white.svg">
+  <img src="docs/assets/hindsight-logo-wordmark.svg" alt="Hindsight" width="260">
+</picture>
+
 # Hindsight
 
 Hindsight is an Atlassian Forge app for Jira Service Management, Jira and Confluence. For a past incident, it looks back at the comments, tickets and pages created before the incident, finds the early signals that already pointed to the problem, and shows where they stopped travelling. Routes approved by people then help similar signals reach the right team next time.
