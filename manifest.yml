@@ -241,7 +241,7 @@ modules:
       name: Hindsight signals
       icons:
         light: resource:icons;hindsight.svg
-        dark: resource:icons;hindsight.svg
+        dark: resource:icons;hindsight-dark.svg
       objectTypes:
         - atlassian:document
         - atlassian:software-service

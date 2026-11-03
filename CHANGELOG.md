@@ -116,6 +116,7 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), dan p
 
 ### Changed
 
+- Ikon app baru (huruf "H" gradien biru-ungu dengan titik sinyal amber, latar transparan) di `static/icons/hindsight.svg`; ikon connector Teamwork Graph mode gelap memakai `static/icons/hindsight-dark.svg`. Ter-deploy dev 4.16.0 dan production 2.5.0.
 - Trigger event kerja dipecah: trigger Jira (`created:issue`, `commented:issue`) memakai `filter.ignoreSelf: true`, sedangkan trigger Confluence (`created:page`, `updated:page`, `created:comment`) terpisah. Approve rute yang sedang Paused ditolak (pakai Resume).
 - Setup: setelah Load/Reset selesai tampil checklist pra-rekam ("Before recording: … Do not Reset or Analyze again while recording.").
 - `onConnectionChange` tidak lagi menulis objek spike `atlassian:document` ke Teamwork Graph; penulisan nyata menyusul dari pipeline.
