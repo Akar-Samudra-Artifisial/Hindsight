@@ -8,11 +8,23 @@ const repoMock = vi.hoisted(() => ({
   releaseAppLock: vi.fn(),
   getJob: vi.fn(),
   updateJob: vi.fn(),
+  getActiveGraphConnection: vi.fn(),
+  listKeptCandidates: vi.fn(),
+  setSetting: vi.fn(),
+  getSetting: vi.fn(),
+  listDemoArtifacts: vi.fn(),
 }));
+const tw = vi.hoisted(() => ({ writeDossier: vi.fn() }));
+const jiraMock = vi.hoisted(() => ({ getIssueSelf: vi.fn() }));
+vi.mock('../src/adapters/teamworkGraph', () => tw);
+vi.mock('../src/adapters/jira', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/adapters/jira')>();
+  return { ...actual, jira: { ...actual.jira, ...jiraMock } };
+});
 const queue = vi.hoisted(() => ({ push: vi.fn() }));
 const collect = vi.hoisted(() => ({ runCollectStep: vi.fn() }));
 vi.mock('../src/adapters/sql', () => sql);
-vi.mock('../src/adapters/repo', () => ({ repo: repoMock }));
+vi.mock('../src/adapters/repo', async (importOriginal) => ({ ...(await importOriginal<typeof import('../src/adapters/repo')>()), repo: repoMock }));
 vi.mock('@forge/events', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@forge/events')>();
   class Queue {
@@ -28,7 +40,9 @@ vi.mock('@forge/events', async (importOriginal) => {
 });
 vi.mock('../src/core/collect', async (importOriginal) => ({ ...(await importOriginal<typeof import('../src/core/collect')>()), ...collect }));
 
-const { collectEvents, migrateSchema, onAppLifecycle, onConnectionChange, retryLater, SCHEMA_RETRY_SECONDS } = await import('../src/surfaces/background');
+const { collectEvents, demoJob, migrateSchema, onAppLifecycle, onConnectionChange, retryLater, SCHEMA_RETRY_SECONDS, scoreCandidates } = await import(
+  '../src/surfaces/background'
+);
 
 const created = {
   action: 'CREATED',
@@ -52,6 +66,13 @@ beforeEach(() => {
   repoMock.updateJob.mockReset().mockResolvedValue(1);
   queue.push.mockReset().mockResolvedValue({ jobId: 'q' });
   collect.runCollectStep.mockReset();
+  repoMock.getActiveGraphConnection.mockReset().mockResolvedValue({ connectionId: 'conn-secret', name: 'Hindsight signals' });
+  repoMock.listKeptCandidates.mockReset().mockResolvedValue([{ daysBefore: 12 }, { daysBefore: 3 }, { daysBefore: 6 }]);
+  repoMock.setSetting.mockReset().mockResolvedValue(undefined);
+  repoMock.getSetting.mockReset().mockResolvedValue(undefined);
+  repoMock.listDemoArtifacts.mockReset().mockResolvedValue([{ slot: 'incident', artifactKey: 'INC-7' }]);
+  tw.writeDossier.mockReset().mockResolvedValue({ success: true, accepted: 1, rejected: 0 });
+  jiraMock.getIssueSelf.mockReset().mockResolvedValue({ id: '1', key: 'INC-7', siteUrl: 'https://one.atlassian.net' });
 });
 
 const JOB = '0b6c2f6e-4b7a-4c51-9a55-8f1d3c2a1e00';
@@ -187,5 +208,86 @@ describe('collectEvents', () => {
 
   it('rejects a body without a valid job id', async () => {
     await expect(collectEvents({ body: { jobId: 'nope' } })).rejects.toThrow('jobId');
+  });
+});
+
+describe('scoreCandidates (dossier, gate G3)', () => {
+  beforeEach(() => {
+    repoMock.getJob.mockResolvedValue({ id: JOB, incidentKey: 'INC-7', windowDays: 30, candidateCount: 3, status: 'scoring' });
+  });
+
+  it('never writes the EVERYONE dossier for a non-demo incident without the opt-in', async () => {
+    repoMock.listDemoArtifacts.mockResolvedValue([{ slot: 'incident', artifactKey: 'INC-1' }]);
+    await scoreCandidates({ body: { jobId: JOB } });
+    expect(tw.writeDossier).not.toHaveBeenCalled();
+    expect(console.info).toHaveBeenCalledWith('dossier skipped', { incidentKey: 'INC-7', reason: 'not demo incident' });
+    expect(repoMock.setSetting).not.toHaveBeenCalled();
+  });
+
+  it('writes for any incident when settings.dossier_all_incidents is true', async () => {
+    repoMock.listDemoArtifacts.mockResolvedValue([]);
+    repoMock.getSetting.mockImplementation(async (k: string) => (k === 'dossier_all_incidents' ? true : undefined));
+    await scoreCandidates({ body: { jobId: JOB } });
+    expect(tw.writeDossier).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['collecting', 'failed'])('skips a job that is %s', async (status) => {
+    repoMock.getJob.mockResolvedValue({ id: JOB, incidentKey: 'INC-7', windowDays: 30, candidateCount: 0, status });
+    await scoreCandidates({ body: { jobId: JOB } });
+    expect(tw.writeDossier).not.toHaveBeenCalled();
+    expect(console.info).toHaveBeenCalledWith('dossier skipped', { incidentKey: 'INC-7', reason: `job is ${status}` });
+  });
+
+  it('writes the dossier through the stored connection and records the outcome', async () => {
+    expect(await scoreCandidates({ body: { jobId: JOB } })).toBeUndefined();
+    expect(tw.writeDossier).toHaveBeenCalledTimes(1);
+    const [connectionId, doc] = tw.writeDossier.mock.calls[0] as [string, { id: string; url: string; description: string }];
+    expect(connectionId).toBe('conn-secret');
+    expect(doc).toMatchObject({ id: 'dossier-inc-7', url: 'https://one.atlassian.net/browse/INC-7' });
+    expect(doc.description).toContain('3 candidate early signals in the 30 days before the incident; the earliest 12 days before');
+    expect(console.info).toHaveBeenCalledWith('dossier written', { incidentKey: 'INC-7', accepted: 1, rejected: 0, connectionId: '<redacted>' });
+    expect(repoMock.setSetting).toHaveBeenCalledWith('dossier_last', expect.objectContaining({ incidentKey: 'INC-7', accepted: 1, rejected: 0 }));
+    expect(JSON.stringify((console.info as unknown as { mock: { calls: unknown[] } }).mock.calls)).not.toContain('conn-secret');
+  });
+
+  it('skips without a connection', async () => {
+    repoMock.getActiveGraphConnection.mockResolvedValue(undefined);
+    await scoreCandidates({ body: { jobId: JOB } });
+    expect(tw.writeDossier).not.toHaveBeenCalled();
+    expect(console.info).toHaveBeenCalledWith('dossier skipped', { incidentKey: 'INC-7', reason: 'no connection' });
+    expect(repoMock.setSetting).toHaveBeenCalledWith('dossier_last', expect.objectContaining({ skipped: 'no connection' }));
+  });
+
+  it('never throws when the write or a read fails', async () => {
+    tw.writeDossier.mockResolvedValue({ success: false, accepted: 0, rejected: 1, error: 'bad object' });
+    await expect(scoreCandidates({ body: { jobId: JOB } })).resolves.toBeUndefined();
+    expect(console.warn).toHaveBeenCalledWith('dossier failed', expect.objectContaining({ incidentKey: 'INC-7', error: 'bad object' }));
+    jiraMock.getIssueSelf.mockRejectedValue(new Error('Jira 500'));
+    await expect(scoreCandidates({ body: { jobId: JOB } })).resolves.toBeUndefined();
+    expect(repoMock.setSetting).toHaveBeenLastCalledWith('dossier_last', expect.objectContaining({ error: 'Jira 500' }));
+  });
+
+  it('asks for a retry while the schema is setting up, and ignores a body without a job id', async () => {
+    sql.ensureSchema.mockRejectedValueOnce(new SchemaSettingUpError(8, 9));
+    expect(await scoreCandidates({ body: { jobId: JOB } })).toMatchObject({ retryOptions: { retryData: { reason: 'schema' } } });
+    expect(await scoreCandidates({ body: {} })).toBeUndefined();
+    expect(tw.writeDossier).not.toHaveBeenCalled();
+  });
+});
+
+describe('demoJob consumer', () => {
+  it('asks for a retry with retryData while the schema is setting up', async () => {
+    sql.ensureSchema.mockRejectedValueOnce(new SchemaSettingUpError(8, 9));
+    expect(await demoJob({ body: { jobId: JOB, attempt: 1 } })).toMatchObject({ retryOptions: { retryData: { reason: 'schema' } } });
+  });
+
+  it('ignores an event for a job that is not the current one', async () => {
+    repoMock.getSetting.mockResolvedValue(undefined);
+    expect(await demoJob({ body: { jobId: JOB, attempt: 1 } })).toBeUndefined();
+    expect(console.info).toHaveBeenCalledWith('demo job: event ignored', expect.objectContaining({ jobId: JOB }));
+  });
+
+  it('rejects a body without a valid job id', async () => {
+    await expect(demoJob({ body: { jobId: 'x' } })).rejects.toThrow('jobId');
   });
 });

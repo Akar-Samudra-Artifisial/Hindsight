@@ -45,7 +45,7 @@ function columnNames(statement: string): string[] {
 }
 
 describe('MIGRATIONS', () => {
-  it('has the eight week-2 tables, v001–v008, unique names in order', () => {
+  it('has the nine tables, v001–v009, unique names in order', () => {
     const names = MIGRATIONS.map((m) => m.name);
     expect(new Set(names).size).toBe(names.length);
     expect(names).toEqual([
@@ -57,8 +57,9 @@ describe('MIGRATIONS', () => {
       'v006_create_events',
       'v007_create_analysis_jobs',
       'v008_create_signal_candidates',
+      'v009_create_demo_artifacts',
     ]);
-    expect(LATEST_MIGRATION).toBe('v008_create_signal_candidates');
+    expect(LATEST_MIGRATION).toBe('v009_create_demo_artifacts');
   });
 
   it.each(MIGRATIONS.map((m) => [m.name, m.statement]))('%s is a single idempotent statement without foreign keys', (_name, statement) => {

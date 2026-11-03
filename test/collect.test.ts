@@ -140,7 +140,7 @@ function fakeRepo(initial: Partial<AnalysisJob> = {}) {
 
 class RateLimited extends Error {}
 
-function makeDeps(repo: CollectDeps['repo'], jiraPages: RawIssue[][], confPages: RawContent[][]) {
+function makeDeps(repo: CollectDeps['repo'], jiraPages: RawIssue[][], confPages: RawContent[][], siteUrl: string | null = 'https://one.atlassian.net') {
   const searchPage = vi.fn(async (_jql: string, token: string | undefined) => {
     const i = token ? Number(token) : 0;
     const next = i + 1 < jiraPages.length ? { nextPageToken: String(i + 1) } : {};
@@ -155,7 +155,7 @@ function makeDeps(repo: CollectDeps['repo'], jiraPages: RawIssue[][], confPages:
   let id = 0;
   const deps: CollectDeps = {
     repo,
-    jira: { searchPage, listComments },
+    jira: { searchPage, listComments, siteUrl: vi.fn(async () => siteUrl) },
     confluence: { searchContent },
     isRateLimited: (err) => err instanceof RateLimited,
     now: () => Date.parse('2026-11-25T00:00:00Z'),
@@ -388,5 +388,24 @@ describe('review fixes', () => {
     const list = [{ id: 'a', author: { accountId: 'u1' }, body: adf('anyone?'), created: daysAgo(3) }];
     expect(commentItems(meta, list, 150).items[0]?.isLastComment).toBe(false);
     expect(commentItems(meta, list, 1).items[0]?.isLastComment).toBe(true);
+  });
+});
+
+describe('Jira links use the site URL, not the asApp gateway self link', () => {
+  it('stores browse URLs on the site even when self points at api.atlassian.com', async () => {
+    const f = fakeRepo();
+    const gateway = (n: number): RawIssue => ({ ...issue(n), self: `https://api.atlassian.com/ex/jira/abc/rest/api/3/issue/${1000 + n}` });
+    const { deps } = makeDeps(f.repo, [[gateway(2)]], [], 'https://one-atlas-vyyd.atlassian.net');
+    await runCollectStep('job-1', deps, budget(5));
+    const urls = [...f.events.values()].map((e) => e.url).filter((u): u is string => typeof u === 'string');
+    expect(urls.length).toBeGreaterThan(0);
+    for (const u of urls) expect(u.startsWith('https://one-atlas-vyyd.atlassian.net/browse/')).toBe(true);
+    expect(deps.jira.siteUrl).toHaveBeenCalledTimes(1);
+  });
+
+  it('issueMeta never uses the gateway host as a link base', () => {
+    const meta = issueMeta({ ...issue(1), self: 'https://api.atlassian.com/ex/jira/abc/rest/api/3/issue/1' });
+    expect(meta.base).toBeNull();
+    expect(issueMeta(issue(1), 'https://one-atlas-vyyd.atlassian.net').base).toBe('https://one-atlas-vyyd.atlassian.net');
   });
 });

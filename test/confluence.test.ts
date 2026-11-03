@@ -82,3 +82,37 @@ describe('cursorFromNext', () => {
     expect(cursorFromNext(undefined)).toBeUndefined();
   });
 });
+
+describe('confluence demo seed calls', () => {
+  it('createFooterComment uses v2 when allowed', async () => {
+    api.appRequest.mockResolvedValue(reply(200, { id: 42 }));
+    expect(await confluence.createFooterComment('9', '<p>x</p>')).toEqual({ id: '42', via: 'v2' });
+    expect(pathOf(api.appRequest.mock.calls[0] as unknown[])).toBe('/wiki/api/v2/footer-comments');
+  });
+
+  it('createFooterComment falls back to v1 when v2 is refused', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    api.appRequest.mockResolvedValueOnce(reply(403, { message: 'scope' })).mockResolvedValueOnce(reply(200, { id: 43 }));
+    expect(await confluence.createFooterComment('9', '<p>x</p>')).toEqual({ id: '43', via: 'v1' });
+    const v1 = api.appRequest.mock.calls[1] as unknown[];
+    expect(pathOf(v1)).toBe('/wiki/rest/api/content');
+    expect(JSON.parse((v1[1] as { body: string }).body)).toMatchObject({ type: 'comment', container: { id: '9', type: 'page' } });
+  });
+
+  it('createFooterComment throws on other errors', async () => {
+    api.appRequest.mockResolvedValue(reply(500, { message: 'boom' }));
+    await expect(confluence.createFooterComment('9', '<p>x</p>')).rejects.toThrow('500');
+  });
+
+  it('deletePage trashes then purges; a failed purge is only logged', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    api.appRequest.mockResolvedValueOnce(reply(204, undefined)).mockResolvedValueOnce(reply(403, { message: 'no' }));
+    await expect(confluence.deletePage('9')).resolves.toBeUndefined();
+    expect((api.appRequest.mock.calls as unknown[][]).map(pathOf)).toEqual(['/wiki/api/v2/pages/9', '/wiki/api/v2/pages/9?purge=true']);
+  });
+
+  it('countByCql reads totalSize', async () => {
+    api.appRequest.mockResolvedValue(reply(200, { results: [], totalSize: 6 }));
+    expect(await confluence.countByCql('label = "hindsight-demo"')).toBe(6);
+  });
+});

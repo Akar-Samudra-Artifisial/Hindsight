@@ -1,5 +1,11 @@
 /** Jira issue key, e.g. INC-1. Project keys start with a letter; Jira allows letters, digits and underscores. */
 const ISSUE_KEY = /^[A-Z][A-Z0-9_]{0,254}-[1-9][0-9]*$/;
+/** Jira project key; whitelisted before it is quoted into JQL. */
+export const PROJECT_KEY = /^[A-Z][A-Z0-9_]{0,254}$/;
+/** Confluence space key (personal spaces start with `~`); whitelisted before it is quoted into CQL. */
+export const SPACE_KEY = /^~?[A-Za-z0-9_-]{1,255}$/;
+/** Service key of a mapping (also accepted from the `hindsight` issue property). */
+export const SERVICE_KEY = /^[A-Za-z0-9_.-]{1,64}$/;
 
 export class InputError extends Error {}
 
@@ -22,4 +28,82 @@ export function parseWindowDays(value: unknown): number {
   const days = Number(text);
   if (days < 1 || days > MAX_WINDOW_DAYS) throw new InputError(`windowDays must be between 1 and ${MAX_WINDOW_DAYS}.`);
   return days;
+}
+
+export const MAX_SERVICE_MAPPINGS = 50;
+export const MAX_MAPPING_LIST_ITEMS = 20;
+const MAX_NAME = 255;
+const MAX_ALIAS = 64;
+
+export interface ParsedServiceMapping {
+  serviceKey: string;
+  displayName: string;
+  jiraProjectKeys: string[];
+  jiraComponentNames: string[];
+  confluenceSpaceKeys: string[];
+  aliases: string[];
+  ownerTeamName: string | null;
+  ownerTeamId: string | null;
+}
+
+export function parseServiceKey(value: unknown): string {
+  const key = typeof value === 'string' ? value.trim() : '';
+  if (!SERVICE_KEY.test(key)) throw new InputError('Service key must be 1–64 letters, digits, ".", "_" or "-".');
+  return key;
+}
+
+/** A list from an array of strings or one comma-separated string; trimmed, empty items dropped, duplicates removed. */
+function textList(value: unknown, field: string): string[] {
+  if (value === undefined || value === null || value === '') return [];
+  const raw = typeof value === 'string' ? value.split(',') : Array.isArray(value) ? value : null;
+  if (!raw || !raw.every((v) => typeof v === 'string')) throw new InputError(`${field} must be a list of text values.`);
+  const items = [...new Set((raw as string[]).map((v) => v.trim()).filter((v) => v !== ''))];
+  if (items.length > MAX_MAPPING_LIST_ITEMS) throw new InputError(`${field} accepts at most ${MAX_MAPPING_LIST_ITEMS} values.`);
+  return items;
+}
+
+function optionalName(value: unknown, field: string): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') throw new InputError(`${field} must be text.`);
+  const text = value.trim();
+  if (text.length > MAX_NAME) throw new InputError(`${field} must be at most ${MAX_NAME} characters.`);
+  return text === '' ? null : text;
+}
+
+/** Validates a service mapping sent by the setup page. Project keys are upper-cased; every list is capped. */
+export function parseServiceMapping(raw: unknown): ParsedServiceMapping {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new InputError('Service mapping must be an object.');
+  const m = raw as Record<string, unknown>;
+  const serviceKey = parseServiceKey(m['serviceKey']);
+  const displayName = typeof m['displayName'] === 'string' ? m['displayName'].trim() : '';
+  if (displayName === '' || displayName.length > MAX_NAME) throw new InputError(`Display name is required (at most ${MAX_NAME} characters).`);
+  const jiraProjectKeys = [...new Set(textList(m['jiraProjectKeys'], 'Jira project keys').map((k) => k.toUpperCase()))];
+  const badProject = jiraProjectKeys.find((k) => !PROJECT_KEY.test(k));
+  if (badProject) throw new InputError(`"${badProject}" is not a Jira project key.`);
+  const confluenceSpaceKeys = textList(m['confluenceSpaceKeys'], 'Confluence space keys');
+  const badSpace = confluenceSpaceKeys.find((k) => !SPACE_KEY.test(k));
+  if (badSpace) throw new InputError(`"${badSpace}" is not a Confluence space key.`);
+  const jiraComponentNames = textList(m['jiraComponentNames'], 'Jira component names');
+  if (jiraComponentNames.some((c) => c.length > MAX_NAME)) throw new InputError(`Component names must be at most ${MAX_NAME} characters.`);
+  const aliases = textList(m['aliases'], 'Aliases');
+  if (aliases.some((a) => a.length > MAX_ALIAS)) throw new InputError(`Aliases must be at most ${MAX_ALIAS} characters.`);
+  return {
+    serviceKey,
+    displayName,
+    jiraProjectKeys,
+    jiraComponentNames,
+    confluenceSpaceKeys,
+    aliases,
+    ownerTeamName: optionalName(m['ownerTeamName'], 'Owner team name'),
+    // [VERIFY] format of a team id (ARI or UUID); only length-checked for now.
+    ownerTeamId: optionalName(m['ownerTeamId'], 'Owner team id'),
+  };
+}
+
+export type DemoKind = 'load' | 'reset' | 'remove';
+const DEMO_KINDS: readonly DemoKind[] = ['load', 'reset', 'remove'];
+
+export function parseDemoKind(value: unknown): DemoKind {
+  if (typeof value === 'string' && (DEMO_KINDS as readonly string[]).includes(value)) return value as DemoKind;
+  throw new InputError('kind must be load, reset or remove.');
 }

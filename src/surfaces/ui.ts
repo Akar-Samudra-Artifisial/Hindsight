@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { Queue } from '@forge/events';
 import Resolver from '@forge/resolver';
 import { confluence } from '../adapters/confluence';
@@ -6,11 +7,23 @@ import { repo, type AnalysisJob } from '../adapters/repo';
 import { ensureSchema } from '../adapters/sql';
 import { cloudIdFromInstallContext, readSpike } from '../adapters/teamworkGraph';
 import { filterVisible } from '../core/access';
+import { INCIDENT_SLOT } from '../core/demoData';
+import { DEMO_QUEUE, publicJob, readDemoJob, startDemoJob } from '../core/demoJob';
+import { DOSSIER_STATUS_KEY, type DossierStatus } from '../core/dossier';
 import { MAX_CANDIDATES } from '../core/filter';
+import { containerNotes, existingContainerWarnings } from '../core/seed';
 import { startAnalysis } from '../core/jobs';
 import { MIGRATIONS } from '../core/migrations';
 import { SchemaSettingUpError } from '../core/schema';
-import { InputError, parseIncidentKey, parseWindowDays } from '../core/validate';
+import {
+  InputError,
+  MAX_SERVICE_MAPPINGS,
+  parseDemoKind,
+  parseIncidentKey,
+  parseServiceKey,
+  parseServiceMapping,
+  parseWindowDays,
+} from '../core/validate';
 
 const SETUP_MODULE = 'hindsight-setup';
 const SURFACES = new Set(['incident', 'insights', 'setup']);
@@ -49,6 +62,8 @@ interface ResolverContext {
 }
 
 const collectQueue = new Queue({ key: 'collect' });
+const scoreQueue = new Queue({ key: 'score' });
+const demoQueue = new Queue({ key: DEMO_QUEUE });
 const EXCERPT_PREVIEW = 400;
 
 /** Incident key from the payload, else the issue the panel is open on. */
@@ -65,6 +80,17 @@ async function guarded<T>(run: () => Promise<T>): Promise<T | { error: string } 
     if (err instanceof SchemaSettingUpError) return { ready: false, applied: err.applied, total: err.total };
     throw err;
   }
+}
+
+/**
+ * Gate for every setup mutation: the call must come from the Hindsight setup page and the current user must be a
+ * Jira administrator (`mypermissions` as the user). Throws InputError, which `guarded` turns into `{ error }`.
+ */
+async function requireSetupAdmin(ctx: ResolverContext, what: string): Promise<string> {
+  if (ctx.moduleKey !== SETUP_MODULE) throw new InputError(`${what} is only available on Hindsight setup.`);
+  if (!ctx.accountId) throw new InputError('No user in context.');
+  if (!(await jira.isAdminAsUser())) throw new InputError('Only Jira administrators can change Hindsight setup.');
+  return ctx.accountId;
 }
 
 /** Starts (or returns the running) analysis of the incident, as the current user. */
@@ -115,8 +141,9 @@ resolver.define('getAnalysis', async ({ payload, context }) =>
     await ensureSchema();
     const incident = await jira.getIncidentAsUser(incidentKey);
     if (!incident) throw new InputError(`Incident ${incidentKey} was not found, or you do not have permission to view it.`);
-    const job = await repo.getLatestJobForIncident(incidentKey);
-    if (!job) return { ready: true, incidentKey, job: null, funnel: null, candidates: [], hiddenCount: 0 };
+    const [job, stored] = await Promise.all([repo.getLatestJobForIncident(incidentKey), repo.getIncident(incidentKey)]);
+    const simulated = { simulated: stored?.scenarioStartedAt != null, scenarioStartedAt: stored?.scenarioStartedAt ?? null };
+    if (!job) return { ready: true, incidentKey, ...simulated, job: null, funnel: null, candidates: [], hiddenCount: 0 };
     const kept = await repo.listKeptCandidates(job.id, MAX_CANDIDATES);
     const events = new Map((await repo.getEventsByIds(kept.map((c) => c.eventId))).map((e) => [e.id, e]));
     const { visible, hiddenCount } = await filterVisible(
@@ -126,6 +153,7 @@ resolver.define('getAnalysis', async ({ payload, context }) =>
     return {
       ready: true,
       incidentKey,
+      ...simulated,
       job: jobView(job),
       funnel: { scanned: job.scannedCount, stored: job.storedCount, candidates: job.candidateCount, truncated: job.truncatedCount },
       candidates: visible.flatMap(({ candidate: c, event: e }) =>
@@ -172,5 +200,107 @@ resolver.define('twgSpike', async ({ context }) => {
   if (!cloudId) return { error: 'Site id unavailable.' };
   return readSpike(cloudId, ctx.accountId);
 });
+
+// --- Service mappings (setup, admin only) ---------------------------------------------------------
+
+resolver.define('listServiceMappings', async ({ context }) =>
+  guarded(async () => {
+    await requireSetupAdmin(context as ResolverContext, 'listServiceMappings');
+    await ensureSchema();
+    return { ready: true, mappings: await repo.listServiceMappings(), max: MAX_SERVICE_MAPPINGS };
+  }),
+);
+
+resolver.define('saveServiceMapping', async ({ payload, context }) =>
+  guarded(async () => {
+    await requireSetupAdmin(context as ResolverContext, 'saveServiceMapping');
+    const mapping = parseServiceMapping(payload['mapping']);
+    await ensureSchema();
+    const existing = await repo.listServiceMappings();
+    if (!existing.some((m) => m.serviceKey === mapping.serviceKey) && existing.length >= MAX_SERVICE_MAPPINGS) {
+      throw new InputError(`Hindsight supports at most ${MAX_SERVICE_MAPPINGS} service mappings.`);
+    }
+    await repo.upsertServiceMapping(mapping);
+    console.info('service mapping saved', { serviceKey: mapping.serviceKey });
+    return { ready: true, mappings: await repo.listServiceMappings(), max: MAX_SERVICE_MAPPINGS };
+  }),
+);
+
+resolver.define('deleteServiceMapping', async ({ payload, context }) =>
+  guarded(async () => {
+    await requireSetupAdmin(context as ResolverContext, 'deleteServiceMapping');
+    const serviceKey = parseServiceKey(payload['serviceKey']);
+    await ensureSchema();
+    const deleted = await repo.deleteServiceMapping(serviceKey);
+    console.info('service mapping deleted', { serviceKey, deleted });
+    return { ready: true, mappings: await repo.listServiceMappings(), max: MAX_SERVICE_MAPPINGS };
+  }),
+);
+
+// --- Demo data (setup, admin only) ----------------------------------------------------------------
+
+async function demoIncidentKey(): Promise<string | null> {
+  const artifacts = await repo.listDemoArtifacts();
+  return artifacts.find((a) => a.slot === INCIDENT_SLOT)?.artifactKey ?? null;
+}
+
+resolver.define('startDemoJob', async ({ payload, context }) =>
+  guarded(async () => {
+    const accountId = await requireSetupAdmin(context as ResolverContext, 'startDemoJob');
+    const kind = parseDemoKind(payload['kind']);
+    await ensureSchema();
+    const result = await startDemoJob(kind, accountId, {
+      repo,
+      push: async (jobId) => {
+        await demoQueue.push({ body: { jobId, attempt: 1 } });
+      },
+      now: Date.now,
+      newId: randomUUID,
+    });
+    if ('job' in result) console.info('demo job start', { kind, started: result.started, jobId: result.job.id });
+    return { ready: true, ...result };
+  }),
+);
+
+resolver.define('getDemoJob', async ({ context }) =>
+  guarded(async () => {
+    await requireSetupAdmin(context as ResolverContext, 'getDemoJob');
+    await ensureSchema();
+    const job = await readDemoJob({ repo, now: Date.now });
+    const artifacts = await repo.listDemoArtifacts();
+    return {
+      ready: true,
+      job: job ? publicJob(job) : null,
+      incidentKey: artifacts.find((a) => a.slot === INCIDENT_SLOT)?.artifactKey ?? null,
+      warnings: existingContainerWarnings(artifacts),
+      notes: containerNotes(artifacts).filter((n) => !existingContainerWarnings(artifacts).includes(n)),
+    };
+  }),
+);
+
+// --- Teamwork Graph dossier (setup, admin only) ----------------------------------------------------
+
+/** Queues a `score` run for the demo incident's latest analysis; the consumer writes the dossier (never the resolver). */
+resolver.define('writeTestDossier', async ({ context }) =>
+  guarded(async () => {
+    await requireSetupAdmin(context as ResolverContext, 'writeTestDossier');
+    await ensureSchema();
+    const incidentKey = await demoIncidentKey();
+    if (!incidentKey) throw new InputError('There is no demo incident yet. Click Load demo data first.');
+    const job = await repo.getLatestCollectedJobForIncident(incidentKey);
+    if (!job) throw new InputError(`No finished analysis of ${incidentKey} yet. Open ${incidentKey}, click Analyze and wait until the candidates appear.`);
+    await scoreQueue.push({ body: { jobId: job.id } });
+    console.info('test dossier queued', { incidentKey, jobId: job.id });
+    return { ready: true, queued: true, incidentKey };
+  }),
+);
+
+resolver.define('getDossierStatus', async ({ context }) =>
+  guarded(async () => {
+    await requireSetupAdmin(context as ResolverContext, 'getDossierStatus');
+    await ensureSchema();
+    return { ready: true, last: (await repo.getSetting<DossierStatus>(DOSSIER_STATUS_KEY)) ?? null };
+  }),
+);
 
 export const handler = resolver.getDefinitions();

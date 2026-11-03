@@ -283,6 +283,61 @@ export interface Candidate {
   status: string;
 }
 
+export type DemoRole = 'container' | 'incident' | 'signal' | 'context' | 'distractor';
+
+/** One demo artifact slot. Comment rows carry the parent issue/page id in `artifactId` and their own id in `commentId`. */
+export interface DemoArtifactInput {
+  slot: string;
+  role: DemoRole;
+  /** Event source of the artifact (`jira`/`jsm`/`confluence`), or `project`/`space` for containers. */
+  source: string;
+  artifactId: string;
+  commentId?: string;
+  artifactKey?: string | null;
+  url?: string | null;
+  scenarioAt?: string | null;
+  createdByApp: boolean;
+}
+
+export interface DemoArtifact {
+  slot: string;
+  role: DemoRole;
+  source: string;
+  artifactId: string;
+  commentId: string;
+  artifactKey: string | null;
+  url: string | null;
+  scenarioAt: string | null;
+  createdByApp: boolean;
+  createdAt: string;
+}
+
+/** Pre-seeded event row: the reference columns plus the demo scenario time. */
+export interface ScenarioEventInput {
+  source: EventSource;
+  kind: string;
+  artifactId: string;
+  commentId: string;
+  artifactKey: string | null;
+  title: string;
+  url: string | null;
+  projectKey: string | null;
+  spaceKey: string | null;
+  occurredAt: string;
+  scenarioAt: string;
+}
+
+export interface IncidentScenarioInput {
+  issueKey: string;
+  issueId: string;
+  projectKey: string;
+  summary: string;
+  serviceKey: string;
+  startedAt: string;
+  scenarioStartedAt: string;
+  scenarioResolvedAt: string;
+}
+
 // --- Row mappers ----------------------------------------------------------------------------------
 
 const GRAPH_CONNECTION_COLS = 'connection_id, name, connector_name, flow_name, last_action, status, created_at, updated_at';
@@ -320,6 +375,25 @@ const JOB_COLS =
 const CANDIDATE_COLS =
   'id, job_id, incident_key, event_id, filter_score, reasons, matched_keywords, hint_type, excerpt, text_hash, days_before, status';
 const CANDIDATE_WRITE_COLS = CANDIDATE_COLS.split(', ');
+const DEMO_ARTIFACT_COLS = 'slot, role, source, artifact_id, comment_id, artifact_key, url, scenario_at, created_by_app, created_at';
+const SCENARIO_EVENT_COLS =
+  'id, source, kind, artifact_id, comment_id, artifact_key, title, url, project_key, space_key, occurred_at, scenario_at';
+export const MAX_DEMO_ARTIFACTS = 500;
+
+function toDemoArtifact(r: Row): DemoArtifact {
+  return {
+    slot: String(r.slot),
+    role: String(r.role) as DemoRole,
+    source: String(r.source),
+    artifactId: String(r.artifact_id),
+    commentId: String(r.comment_id ?? ''),
+    artifactKey: str(r.artifact_key),
+    url: str(r.url),
+    scenarioAt: fromSqlTs(r.scenario_at),
+    createdByApp: int(r.created_by_app) === 1,
+    createdAt: requiredTs(r.created_at),
+  };
+}
 
 function toGraphConnection(r: Row): GraphConnection {
   return {
@@ -495,6 +569,8 @@ const JOB_PATCH_COLUMNS: { [K in keyof JobPatch]-?: [column: string, toSql: (v: 
 };
 
 const TERMINAL_JOB_STATUSES: readonly JobStatus[] = ['done', 'failed'];
+/** Job statuses after a finished collect: its candidates are final. */
+export const COLLECTED_JOB_STATUSES: readonly JobStatus[] = ['scoring', 'reaching', 'proposing', 'done'];
 
 // --- Repository -----------------------------------------------------------------------------------
 
@@ -585,6 +661,112 @@ export const repo = {
     );
     const rows = await query<Row>('SELECT id FROM service_mappings WHERE service_key = ?', m.serviceKey);
     return rows[0] ? String(rows[0].id) : id;
+  },
+
+  /** Returns affected rows (0 when the service key does not exist). */
+  async deleteServiceMapping(serviceKey: string): Promise<number> {
+    return execute('DELETE FROM service_mappings WHERE service_key = ?', serviceKey);
+  },
+
+  // Demo seed
+  async listDemoArtifacts(): Promise<DemoArtifact[]> {
+    const rows = await query<Row>(
+      `SELECT ${DEMO_ARTIFACT_COLS} FROM demo_artifacts ORDER BY created_at ASC, slot ASC LIMIT ${sqlInt(MAX_DEMO_ARTIFACTS, 1, MAX_DEMO_ARTIFACTS)}`,
+    );
+    return rows.map(toDemoArtifact);
+  },
+
+  async upsertDemoArtifact(a: DemoArtifactInput): Promise<void> {
+    await execute(
+      `INSERT INTO demo_artifacts (slot, role, source, artifact_id, comment_id, artifact_key, url, scenario_at, created_by_app)
+       VALUES (${placeholders(9)})
+       ON DUPLICATE KEY UPDATE role = VALUES(role), source = VALUES(source), artifact_id = VALUES(artifact_id),
+         comment_id = VALUES(comment_id), artifact_key = VALUES(artifact_key), url = VALUES(url), scenario_at = VALUES(scenario_at),
+         created_by_app = VALUES(created_by_app)`,
+      a.slot,
+      a.role,
+      a.source,
+      a.artifactId,
+      a.commentId ?? '',
+      a.artifactKey ?? null,
+      a.url ?? null,
+      tsOrNull(a.scenarioAt),
+      a.createdByApp ? 1 : 0,
+    );
+  },
+
+  async deleteDemoArtifacts(slots: readonly string[]): Promise<number> {
+    let affected = 0;
+    for (const batch of chunk(slots, 100)) {
+      affected += await execute(`DELETE FROM demo_artifacts WHERE slot IN (${placeholders(batch.length)})`, ...batch);
+    }
+    return affected;
+  },
+
+  /**
+   * Inserts demo event rows with their scenario time. An existing row (already collected) only gets `scenario_at`
+   * updated; collect fills in the remaining columns later.
+   */
+  async seedScenarioEvents(rows: readonly ScenarioEventInput[]): Promise<number> {
+    const rowPlaceholder = `(${placeholders(12)})`;
+    let affected = 0;
+    for (const batch of chunk(rows, BATCH_ROWS)) {
+      affected += await execute(
+        `INSERT INTO events (${SCENARIO_EVENT_COLS}) VALUES ${batch.map(() => rowPlaceholder).join(', ')}
+         ON DUPLICATE KEY UPDATE scenario_at = VALUES(scenario_at)`,
+        ...batch.flatMap((e) => [
+          randomUUID(),
+          e.source,
+          e.kind,
+          e.artifactId,
+          e.commentId,
+          e.artifactKey,
+          e.title.slice(0, 512),
+          e.url,
+          e.projectKey,
+          e.spaceKey,
+          toSqlTs(e.occurredAt),
+          toSqlTs(e.scenarioAt),
+        ]),
+      );
+    }
+    return affected;
+  },
+
+  async deleteEventsByRefs(refs: readonly EventRef[]): Promise<number> {
+    let affected = 0;
+    for (const r of refs) {
+      affected += await execute('DELETE FROM events WHERE source = ? AND artifact_id = ? AND comment_id = ?', r.source, r.artifactId, r.commentId);
+    }
+    return affected;
+  },
+
+  /** Inserts the demo incident row (Jira columns + scenario times); on a re-run only the scenario and service change. */
+  async seedIncidentScenario(i: IncidentScenarioInput): Promise<void> {
+    await execute(
+      `INSERT INTO incidents (issue_key, issue_id, project_key, summary, service_key, service_source, started_at, scenario_started_at, scenario_resolved_at)
+       VALUES (?, ?, ?, ?, ?, 'property', ?, ?, ?)
+       ON DUPLICATE KEY UPDATE service_key = VALUES(service_key), service_source = VALUES(service_source),
+         scenario_started_at = VALUES(scenario_started_at), scenario_resolved_at = VALUES(scenario_resolved_at)`,
+      i.issueKey,
+      i.issueId,
+      i.projectKey,
+      i.summary.slice(0, 512),
+      i.serviceKey,
+      toSqlTs(i.startedAt),
+      toSqlTs(i.scenarioStartedAt),
+      toSqlTs(i.scenarioResolvedAt),
+    );
+  },
+
+  async deleteIncident(issueKey: string): Promise<number> {
+    return execute('DELETE FROM incidents WHERE issue_key = ?', issueKey);
+  },
+
+  /** Removes every analysis job of the incident and its candidates (two statements). */
+  async deleteJobsForIncident(incidentKey: string): Promise<number> {
+    await execute('DELETE FROM signal_candidates WHERE incident_key = ?', incidentKey);
+    return execute('DELETE FROM analysis_jobs WHERE incident_key = ?', incidentKey);
   },
 
   // Incidents
@@ -723,6 +905,17 @@ export const repo = {
   /** Most recent job of an incident, whatever its status. */
   async getLatestJobForIncident(incidentKey: string): Promise<AnalysisJob | undefined> {
     const rows = await query<Row>(`SELECT ${JOB_COLS} FROM analysis_jobs WHERE incident_key = ? ORDER BY created_at DESC, id DESC LIMIT 1`, incidentKey);
+    return rows[0] ? toJob(rows[0]) : undefined;
+  },
+
+  /** Most recent job of an incident whose collect finished (scoring or later); undefined when none. */
+  async getLatestCollectedJobForIncident(incidentKey: string): Promise<AnalysisJob | undefined> {
+    const rows = await query<Row>(
+      `SELECT ${JOB_COLS} FROM analysis_jobs WHERE incident_key = ? AND status IN (${placeholders(COLLECTED_JOB_STATUSES.length)})
+       ORDER BY created_at DESC, id DESC LIMIT 1`,
+      incidentKey,
+      ...COLLECTED_JOB_STATUSES,
+    );
     return rows[0] ? toJob(rows[0]) : undefined;
   },
 

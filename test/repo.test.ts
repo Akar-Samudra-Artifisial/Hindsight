@@ -218,3 +218,74 @@ describe('extendAppLock', () => {
     expect(executeCalls()[0]).toEqual(['UPDATE app_locks SET until_at = ? WHERE name = ?', '2026-11-02 09:20:00', 'analyze:INC-1']);
   });
 });
+
+describe('demo seed rows', () => {
+  const row = {
+    source: 'jsm' as const,
+    kind: 'comment',
+    artifactId: '10010',
+    commentId: '20020',
+    artifactKey: 'INC-2',
+    title: 'Payment fails at checkout',
+    url: null,
+    projectKey: 'INC',
+    spaceKey: null,
+    occurredAt: '2026-11-03T10:00:00.000Z',
+    scenarioAt: '2026-10-27T09:12:00.000Z',
+  };
+
+  it('seedScenarioEvents writes scenario_at and only updates scenario_at on a duplicate', async () => {
+    await repo.seedScenarioEvents([row]);
+    const [statement, ...params] = executeCalls()[0]!;
+    expect(statement).toContain('scenario_at)');
+    expect(statement).toMatch(/ON DUPLICATE KEY UPDATE scenario_at = VALUES\(scenario_at\)\s*$/);
+    expect(params).toContain('2026-10-27 09:12:00');
+    expect(params).toHaveLength(12);
+  });
+
+  it('upsertEvents still never writes scenario_at', async () => {
+    await repo.upsertEvents([event(1)]);
+    expect(executeCalls()[0]![0]).not.toContain('scenario_at');
+  });
+
+  it('seedIncidentScenario updates only scenario and service columns on a duplicate', async () => {
+    await repo.seedIncidentScenario({
+      issueKey: 'INC-1',
+      issueId: '1',
+      projectKey: 'INC',
+      summary: 'Checkout payments failing',
+      serviceKey: 'checkout',
+      startedAt: '2026-11-03T10:00:00.000Z',
+      scenarioStartedAt: '2026-11-02T09:12:00.000Z',
+      scenarioResolvedAt: '2026-11-02T12:12:00.000Z',
+    });
+    const statement = executeCalls()[0]![0];
+    const update = statement.slice(statement.indexOf('ON DUPLICATE KEY UPDATE'));
+    expect(update).toContain('scenario_started_at = VALUES(scenario_started_at)');
+    expect(update).not.toContain('started_at = VALUES(started_at),');
+    expect(update).not.toContain('summary');
+  });
+
+  it('listDemoArtifacts uses an inline integer LIMIT and maps rows', async () => {
+    sql.query.mockResolvedValue([
+      { slot: 'incident', role: 'incident', source: 'jsm', artifact_id: '1', comment_id: '', artifact_key: 'INC-1', url: null, scenario_at: '2026-11-02 09:12:00', created_by_app: 1, created_at: '2026-11-03 10:00:00' },
+    ]);
+    const rows = await repo.listDemoArtifacts();
+    expect(queryCalls()[0]![0]).toMatch(/LIMIT 500$/);
+    expect(rows[0]).toMatchObject({ slot: 'incident', createdByApp: true, scenarioAt: '2026-11-02T09:12:00.000Z', artifactKey: 'INC-1' });
+  });
+
+  it('deleteJobsForIncident deletes candidates then jobs, one statement each', async () => {
+    await repo.deleteJobsForIncident('INC-1');
+    expect(executeCalls().map((c) => c[0])).toEqual(['DELETE FROM signal_candidates WHERE incident_key = ?', 'DELETE FROM analysis_jobs WHERE incident_key = ?']);
+  });
+});
+
+describe('getLatestCollectedJobForIncident', () => {
+  it('only considers jobs whose collect finished', async () => {
+    await repo.getLatestCollectedJobForIncident('INC-1');
+    const [statement, ...params] = queryCalls()[0]!;
+    expect(statement).toContain('status IN (?, ?, ?, ?)');
+    expect(params).toEqual(['INC-1', 'scoring', 'reaching', 'proposing', 'done']);
+  });
+});

@@ -8,7 +8,7 @@ import { filterEvent, rankCandidates, MAX_CANDIDATES, type CollectedEvent, type 
 import { analyzeLock, ANALYZE_LOCK_SECONDS } from './jobs';
 import { eventServiceKey, parseScope, type Scope } from './scope';
 import { adfToText, hashText, normaliseText, storageToText } from './text';
-import { parseIncidentKey } from './validate';
+import { parseIncidentKey, PROJECT_KEY, SPACE_KEY } from './validate';
 
 /**
  * Collect step (resumable): pages through Jira/JSM issues (+ comments) and Confluence pages/comments of the job's
@@ -63,6 +63,8 @@ export interface CollectDeps {
   jira: {
     searchPage(jql: string, nextPageToken: string | undefined): Promise<{ issues: RawIssue[]; nextPageToken?: string }>;
     listComments(issueId: string, startAt: number, maxResults: number): Promise<{ comments: RawComment[]; total: number }>;
+    /** Browser base URL of the site, or null when unknown. */
+    siteUrl(): Promise<string | null>;
   };
   confluence: { searchContent(cql: string, cursor: string | undefined): Promise<SearchPage> };
   isRateLimited(err: unknown): boolean;
@@ -106,7 +108,8 @@ export interface IssueMeta {
   base: string | null;
 }
 
-export function issueMeta(issue: RawIssue): IssueMeta {
+/** `siteUrl`: browser base URL of the site; the issue's `self` is only a fallback (asApp it points at the API gateway). */
+export function issueMeta(issue: RawIssue, siteUrl: string | null = null): IssueMeta {
   const f = issue.fields ?? {};
   return {
     id: String(issue.id),
@@ -118,7 +121,7 @@ export function issueMeta(issue: RawIssue): IssueMeta {
     labels: f.labels ?? [],
     statusCategory: f.status?.statusCategory?.key ?? null,
     resolutionName: f.resolution?.name ?? null,
-    base: siteBaseFromSelf(issue.self),
+    base: siteUrl ?? siteBaseFromSelf(issue.self),
   };
 }
 
@@ -232,9 +235,6 @@ export function confluenceItem(c: RawContent, base: string | null): CollectedIte
 }
 
 // --- Queries --------------------------------------------------------------------------------------
-
-const PROJECT_KEY = /^[A-Z][A-Z0-9_]{0,254}$/;
-const SPACE_KEY = /^~?[A-Za-z0-9_-]{1,255}$/;
 
 /**
  * Keys only reach JQL/CQL after a whitelist regex (no quotes, backslashes or spaces possible) and are then quoted.
@@ -369,7 +369,10 @@ async function collectUnit(job: AnalysisJob, scope: Scope, cursor: CollectCursor
   const [pending, ...rest] = cursor.pendingComments;
   if (pending) {
     const page = await deps.jira.listComments(pending.meta.id, 0, MAX_COMMENTS_PER_ISSUE);
-    const { items, restricted } = commentItems(pending.meta, page.comments, page.total);
+    // A cursor saved before the site URL fix may still carry the API gateway base.
+    const siteUrl = await deps.jira.siteUrl();
+    const meta = siteUrl ? { ...pending.meta, base: siteUrl } : pending.meta;
+    const { items, restricted } = commentItems(meta, page.comments, page.total);
     const totals = withRestricted(await processItems(job, scope, items, deps), restricted);
     return { cursor: { ...cursor, pendingComments: rest, pages: cursor.pages + 1 }, totals };
   }
@@ -378,13 +381,14 @@ async function collectUnit(job: AnalysisJob, scope: Scope, cursor: CollectCursor
     const { jiraNextPageToken: _token, ...base } = cursor;
     if (!jql) return { cursor: { ...base, phase: afterJira(scope) }, totals: NO_TOTALS };
     const page = await deps.jira.searchPage(jql, cursor.jiraNextPageToken);
+    const siteUrl = await deps.jira.siteUrl();
     const room = MAX_ISSUES_PER_JOB - cursor.issuesSeen;
     const issues = page.issues.slice(0, Math.max(0, room));
     const items: CollectedItem[] = [];
     const pendingNext: PendingIssue[] = [];
     let restricted = 0;
     for (const issue of issues) {
-      const meta = issueMeta(issue);
+      const meta = issueMeta(issue, siteUrl);
       const item = issueItem(issue, meta);
       if (item) items.push(item);
       const comment = issue.fields?.comment;
@@ -509,6 +513,11 @@ export async function runCollectStep(
   }
   // Keep the incident's analyze lock alive while the job is still running.
   await deps.repo.extendAppLock(analyzeLock(job.incidentKey), new Date(deps.now()).toISOString(), ANALYZE_LOCK_SECONDS);
+
+  // One serverInfo call per invocation for the Jira link base.
+  let siteUrl: Promise<string | null> | undefined;
+  const readSiteUrl = deps.jira.siteUrl.bind(deps.jira);
+  deps = { ...deps, jira: { ...deps.jira, siteUrl: () => (siteUrl ??= readSiteUrl()) } };
 
   let cursor = job.status === 'queued' ? initialCursor(scope) : parseCursor(job.cursor, scope);
   const counts: Totals = { scanned: job.scannedCount, stored: job.storedCount, candidates: job.candidateCount };
