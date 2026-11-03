@@ -328,6 +328,86 @@ export interface SignalDecisionInput {
   reason?: string | null;
 }
 
+export type GraphState = 'ok' | 'unknown' | 'pending';
+export type ReachVia = 'resolver' | 'action' | 'mcp';
+
+/**
+ * One hop of a reach path: a team that touched the signal's artifact (teamId null = people in no known team), the
+ * roles of those touches (author, commenter, watcher, contributor) and the earliest known touch. Never an account id.
+ */
+export interface ReachStep {
+  role: string;
+  teamId: string | null;
+  teamName: string | null;
+  /** Earliest touch of this team (ISO); null when no touch had a timestamp (watchers, page contributors). */
+  at: string | null;
+}
+
+/** Who touched an artifact, read from stored events (the author of the issue/page or of one of its comments). */
+export interface EventTouch {
+  source: string;
+  artifactId: string;
+  kind: string;
+  authorAccountId: string;
+  /** Scenario time for demo data, else when it happened. */
+  at: string;
+}
+
+/** Last team that touched the artifact, and how many links were missing to the responder team. */
+export interface ReachStopPoint {
+  teamId: string | null;
+  teamName: string | null;
+  missingLinks: number;
+}
+
+export interface ReachPathInput {
+  signalId: string;
+  incidentKey: string;
+  /** null when the graph could not tell (`graph_state` unknown/pending). */
+  reached: boolean | null;
+  hopCount: number;
+  steps: ReachStep[];
+  stopPoint: ReachStopPoint | null;
+  graphState: GraphState;
+  responderTeamId: string | null;
+  via: ReachVia;
+}
+
+export interface ReachPath extends ReachPathInput {
+  id: string;
+  computedAt: string;
+}
+
+export type RouteSourceType = 'confluence_space' | 'jira_project' | 'jira_component' | 'jira_label';
+export type RouteStatus = 'proposed' | 'active' | 'dismissed';
+
+export interface RouteSpec {
+  keywords: string[];
+  target: { teamId: string; action: 'mention' };
+}
+
+export interface RouteInput {
+  originIncidentKey: string;
+  sourceType: RouteSourceType;
+  sourceKey: string;
+  spec: RouteSpec;
+  reason: string;
+  estimatedDaysSaved: number;
+  maxDaysBefore: number;
+  signalIds: string[];
+  score: number;
+  rankNo: number;
+}
+
+/** A stored route; `decided_by` is deliberately not read back. */
+export interface Route extends RouteInput {
+  id: string;
+  status: RouteStatus;
+  activatedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type DemoRole = 'container' | 'incident' | 'signal' | 'context' | 'distractor';
 
 /** One demo artifact slot. Comment rows carry the parent issue/page id in `artifactId` and their own id in `commentId`. */
@@ -429,6 +509,53 @@ const DEMO_ARTIFACT_COLS = 'slot, role, source, artifact_id, comment_id, artifac
 const SCENARIO_EVENT_COLS =
   'id, source, kind, artifact_id, comment_id, artifact_key, title, url, project_key, space_key, occurred_at, scenario_at';
 export const MAX_DEMO_ARTIFACTS = 500;
+const REACH_COLS =
+  'id, signal_id, incident_key, reached, hop_count, steps_json, stop_point_json, graph_state, responder_team_id, via, computed_at';
+/** Columns a recompute refreshes on the same signal. */
+const REACH_REFRESH_COLS = ['incident_key', 'reached', 'hop_count', 'steps_json', 'stop_point_json', 'graph_state', 'responder_team_id', 'via'] as const;
+const ROUTE_COLS =
+  'id, origin_incident_key, source_type, source_key, spec_json, reason, estimated_days_saved, max_days_before, signal_ids, score, status, rank_no, activated_at, created_at, updated_at';
+/** Columns a recompute refreshes; an active route keeps all of them (and its status is never touched). */
+const ROUTE_REFRESH_COLS = ['spec_json', 'reason', 'estimated_days_saved', 'max_days_before', 'signal_ids', 'score', 'rank_no'] as const;
+export const MAX_REACH_PATHS = 500;
+export const MAX_ROUTES = 50;
+export const MAX_EVENT_TOUCHES = 2000;
+
+function toReachPath(r: Row): ReachPath {
+  return {
+    id: String(r.id),
+    signalId: String(r.signal_id),
+    incidentKey: String(r.incident_key),
+    reached: r.reached === null || r.reached === undefined ? null : int(r.reached) === 1,
+    hopCount: int(r.hop_count),
+    steps: parseJsonColumn<ReachStep[]>(r.steps_json) ?? [],
+    stopPoint: r.stop_point_json === null || r.stop_point_json === undefined ? null : parseJsonColumn<ReachStopPoint>(r.stop_point_json),
+    graphState: String(r.graph_state) as GraphState,
+    responderTeamId: str(r.responder_team_id),
+    via: String(r.via) as ReachVia,
+    computedAt: requiredTs(r.computed_at),
+  };
+}
+
+function toRoute(r: Row): Route {
+  return {
+    id: String(r.id),
+    originIncidentKey: String(r.origin_incident_key),
+    sourceType: String(r.source_type) as RouteSourceType,
+    sourceKey: String(r.source_key),
+    spec: parseJsonColumn<RouteSpec>(r.spec_json),
+    reason: String(r.reason ?? ''),
+    estimatedDaysSaved: Number(r.estimated_days_saved ?? 0),
+    maxDaysBefore: int(r.max_days_before),
+    signalIds: parseJsonColumn<string[]>(r.signal_ids) ?? [],
+    score: Number(r.score ?? 0),
+    status: String(r.status) as RouteStatus,
+    rankNo: int(r.rank_no),
+    activatedAt: fromSqlTs(r.activated_at),
+    createdAt: requiredTs(r.created_at),
+    updatedAt: requiredTs(r.updated_at),
+  };
+}
 
 function toDemoArtifact(r: Row): DemoArtifact {
   return {
@@ -841,10 +968,12 @@ export const repo = {
   },
 
   /**
-   * Removes every analysis job of the incident with its candidates, signals and signal decisions (one statement per
-   * table). Used by Reset / Remove demo data, so confirmed and rejected decisions go too.
+   * Removes every analysis job of the incident with its candidates, signals, signal decisions, reach paths and routes
+   * (one statement per table). Used by Reset / Remove demo data, so confirmed and rejected decisions go too.
    */
   async deleteJobsForIncident(incidentKey: string): Promise<number> {
+    await execute('DELETE FROM reach_paths WHERE incident_key = ?', incidentKey);
+    await execute('DELETE FROM routes WHERE origin_incident_key = ?', incidentKey);
     await execute('DELETE FROM signal_decisions WHERE incident_key = ?', incidentKey);
     await execute('DELETE FROM signals WHERE incident_key = ?', incidentKey);
     await execute('DELETE FROM signal_candidates WHERE incident_key = ?', incidentKey);
@@ -1146,6 +1275,156 @@ export const repo = {
       d.decision,
       d.decidedBy.slice(0, 128),
       d.reason ? d.reason.slice(0, 255) : null,
+    );
+  },
+
+  /** Kept candidates by id (for their matched keywords). */
+  async getCandidatesByIds(ids: readonly string[]): Promise<Candidate[]> {
+    const out: Candidate[] = [];
+    for (const batch of chunk(ids, 100)) {
+      const rows = await query<Row>(`SELECT ${CANDIDATE_COLS} FROM signal_candidates WHERE id IN (${placeholders(batch.length)})`, ...batch);
+      out.push(...rows.map(toCandidate));
+    }
+    return out;
+  },
+
+  /**
+   * Authors of stored events on the given artifacts (the issue/page itself and its comments, which carry the parent
+   * id in `artifact_id`). Rows without an author are skipped; at most `MAX_EVENT_TOUCHES` rows.
+   */
+  async listEventTouches(artifactIds: readonly string[]): Promise<EventTouch[]> {
+    const out: EventTouch[] = [];
+    for (const batch of chunk([...new Set(artifactIds)], 100)) {
+      const rows = await query<Row>(
+        `SELECT source, artifact_id, kind, author_account_id, occurred_at, scenario_at FROM events
+         WHERE author_account_id IS NOT NULL AND artifact_id IN (${placeholders(batch.length)}) LIMIT ${sqlInt(MAX_EVENT_TOUCHES, 1, MAX_EVENT_TOUCHES)}`,
+        ...batch,
+      );
+      for (const r of rows) {
+        out.push({
+          source: String(r.source),
+          artifactId: String(r.artifact_id),
+          kind: String(r.kind),
+          authorAccountId: String(r.author_account_id),
+          at: fromSqlTs(r.scenario_at) ?? requiredTs(r.occurred_at),
+        });
+      }
+    }
+    return out;
+  },
+
+  // Reach paths
+  /**
+   * Inserts or refreshes one reach path per signal (`signal_id` is unique); `computed_at` moves to now. A known (`ok`)
+   * path is never replaced by a `pending` or `unknown` one: `graph_state` is assigned last, so every guard above it
+   * still sees the stored state.
+   */
+  async upsertReachPaths(paths: readonly ReachPathInput[]): Promise<number> {
+    const keep = "graph_state = 'ok' AND VALUES(graph_state) <> 'ok'";
+    const updates = [
+      ...REACH_REFRESH_COLS.filter((c) => c !== 'graph_state').map((c) => `${c} = IF(${keep}, ${c}, VALUES(${c}))`),
+      `computed_at = IF(${keep}, computed_at, CURRENT_TIMESTAMP)`,
+      `graph_state = IF(${keep}, graph_state, VALUES(graph_state))`,
+    ].join(', ');
+    const rowPlaceholder = `(${placeholders(10)})`;
+    let affected = 0;
+    for (const batch of chunk(paths, BATCH_ROWS)) {
+      affected += await execute(
+        `INSERT INTO reach_paths (id, signal_id, incident_key, reached, hop_count, steps_json, stop_point_json, graph_state, responder_team_id, via)
+         VALUES ${batch.map(() => rowPlaceholder).join(', ')} ON DUPLICATE KEY UPDATE ${updates}`,
+        ...batch.flatMap((p) => [
+          randomUUID(),
+          p.signalId,
+          p.incidentKey,
+          p.reached === null ? null : p.reached ? 1 : 0,
+          Math.max(0, Math.trunc(p.hopCount)),
+          JSON.stringify(p.steps),
+          jsonOrNull(p.stopPoint),
+          p.graphState,
+          p.responderTeamId ? p.responderTeamId.slice(0, 255) : null,
+          p.via,
+        ]),
+      );
+    }
+    return affected;
+  },
+
+  async listReachPaths(incidentKey: string): Promise<ReachPath[]> {
+    const rows = await query<Row>(
+      `SELECT ${REACH_COLS} FROM reach_paths WHERE incident_key = ? ORDER BY signal_id ASC LIMIT ${sqlInt(MAX_REACH_PATHS, 1, MAX_REACH_PATHS)}`,
+      incidentKey,
+    );
+    return rows.map(toReachPath);
+  },
+
+  // Routes
+  /**
+   * Inserts routes on `(origin_incident_key, source_type, source_key)`. A duplicate is refreshed unless it is
+   * `active`; the status itself is never updated here, so a recompute cannot demote an approved route.
+   */
+  async upsertRoutes(routes: readonly RouteInput[]): Promise<number> {
+    const updates = ROUTE_REFRESH_COLS.map((c) => `${c} = IF(status = 'active', ${c}, VALUES(${c}))`).join(', ');
+    const rowPlaceholder = `(${placeholders(13)})`;
+    let affected = 0;
+    for (const batch of chunk(routes, BATCH_ROWS)) {
+      affected += await execute(
+        `INSERT INTO routes (id, origin_incident_key, source_type, source_key, spec_json, reason, estimated_days_saved, max_days_before, signal_ids, score, status, rank_no, decided_by)
+         VALUES ${batch.map(() => rowPlaceholder).join(', ')} ON DUPLICATE KEY UPDATE ${updates}`,
+        ...batch.flatMap((r) => [
+          randomUUID(),
+          r.originIncidentKey,
+          r.sourceType,
+          r.sourceKey.slice(0, 255),
+          JSON.stringify(r.spec),
+          r.reason,
+          Math.round(r.estimatedDaysSaved * 10) / 10,
+          Math.trunc(r.maxDaysBefore),
+          JSON.stringify(r.signalIds),
+          Math.round(r.score * 100) / 100,
+          'proposed',
+          Math.trunc(r.rankNo),
+          null,
+        ]),
+      );
+    }
+    return affected;
+  },
+
+  /** Routes proposed for an incident, best rank first; capped at `MAX_ROUTES`. */
+  async listRoutes(incidentKey: string): Promise<Route[]> {
+    const rows = await query<Row>(
+      `SELECT ${ROUTE_COLS} FROM routes WHERE origin_incident_key = ? ORDER BY rank_no ASC, id ASC LIMIT ${sqlInt(MAX_ROUTES, 1, MAX_ROUTES)}`,
+      incidentKey,
+    );
+    return rows.map(toRoute);
+  },
+
+  async getRoute(id: string): Promise<Route | undefined> {
+    const rows = await query<Row>(`SELECT ${ROUTE_COLS} FROM routes WHERE id = ?`, id);
+    return rows[0] ? toRoute(rows[0]) : undefined;
+  },
+
+  /** Deletes the given routes of the incident while they are still `proposed` (an active route is never deleted). */
+  async deleteProposedRoutes(incidentKey: string, ids: readonly string[]): Promise<number> {
+    let affected = 0;
+    for (const batch of chunk(ids, 100)) {
+      affected += await execute(
+        `DELETE FROM routes WHERE origin_incident_key = ? AND status = 'proposed' AND id IN (${placeholders(batch.length)})`,
+        incidentKey,
+        ...batch,
+      );
+    }
+    return affected;
+  },
+
+  /** Compare-and-set status change with the decider; `activated_at` is set when the route becomes active. */
+  async decideRoute(id: string, from: RouteStatus, to: RouteStatus, decidedBy: string): Promise<number> {
+    return execute(
+      `UPDATE routes SET status = ?, decided_by = ?, activated_at = ${to === 'active' ? 'CURRENT_TIMESTAMP' : 'NULL'} WHERE id = ? AND status = ?`,
+      to,
+      decidedBy.slice(0, 128),
+      id,
+      from,
     );
   },
 

@@ -116,3 +116,16 @@ describe('confluence demo seed calls', () => {
     expect(await confluence.countByCql('label = "hindsight-demo"')).toBe(6);
   });
 });
+
+describe('confluence.getPageVersionAuthorsAsUser', () => {
+  it('reads version authors as the user; no access → empty; 429 throws a rate-limit error', async () => {
+    api.userRequest.mockResolvedValueOnce(reply(200, { results: [{ number: 2, authorId: 'u1', createdAt: '2026-11-03T07:33:00.000Z' }, { number: 1, authorId: '' }] }));
+    expect(await confluence.getPageVersionAuthorsAsUser('5079131')).toEqual([{ accountId: 'u1', at: '2026-11-03T07:33:00.000Z' }]);
+    expect(pathOf(api.userRequest.mock.calls[0]!)).toBe('/wiki/api/v2/pages/5079131/versions?limit=50');
+    api.userRequest.mockResolvedValueOnce(reply(403, {}));
+    expect(await confluence.getPageVersionAuthorsAsUser('1')).toEqual([]);
+    api.userRequest.mockResolvedValueOnce(reply(429, { message: 'slow down' }));
+    const err = await confluence.getPageVersionAuthorsAsUser('1').catch((e: unknown) => e);
+    expect(isConfluenceRateLimited(err)).toBe(true);
+  });
+});

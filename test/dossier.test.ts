@@ -62,3 +62,24 @@ describe('tracked dossier ids', () => {
     expect(next[0]).toBe('d1');
   });
 });
+
+describe('dossier reach block', () => {
+  it('adds first signal, gap, reach and the top route as numbers and a source type only (no key)', () => {
+    const text = dossierText({
+      ...base,
+      signalCount: 4,
+      reach: { firstSignalDays: 12, awarenessGapDays: 12, reached: 0, considered: 4, topRoute: { source: 'Confluence space', estimatedDaysSaved: 11, maxDaysBefore: 12 } },
+    });
+    expect(text).toContain('First confirmed signal 12 days before the incident; awareness gap 12 days.');
+    expect(text).toContain('Reach: 0 of 4 confirmed signals reached the responder team before the incident.');
+    expect(text).toContain('Top route: mention the responder team on matching items in a Confluence space, ~11 days earlier (up to 12), assuming the mention is read and acted on.');
+    expect(text).not.toMatch(/"|Arkana|557058:|TLS|PLAT/);
+  });
+
+  it('omits the route sentence without routes and the block before scoring', () => {
+    const text = dossierText({ ...base, signalCount: 1, reach: { firstSignalDays: 3, awarenessGapDays: 0, reached: 1, considered: 1, topRoute: null } });
+    expect(text).toContain('Reach: 1 of 1 confirmed signal reached');
+    expect(text).not.toContain('Top route');
+    expect(dossierText({ ...base })).not.toContain('Reach:');
+  });
+});

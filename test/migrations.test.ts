@@ -45,7 +45,7 @@ function columnNames(statement: string): string[] {
 }
 
 describe('MIGRATIONS', () => {
-  it('has v001–v012, unique names in order', () => {
+  it('has v001–v014, unique names in order', () => {
     const names = MIGRATIONS.map((m) => m.name);
     expect(new Set(names).size).toBe(names.length);
     expect(names).toEqual([
@@ -61,8 +61,27 @@ describe('MIGRATIONS', () => {
       'v010_create_signals',
       'v011_create_signal_decisions',
       'v012_add_signal_candidates_score_error',
+      'v013_create_reach_paths',
+      'v014_create_routes',
     ]);
-    expect(LATEST_MIGRATION).toBe('v012_add_signal_candidates_score_error');
+    expect(LATEST_MIGRATION).toBe('v014_create_routes');
+  });
+
+  it('reach_paths has one row per signal; routes are unique per origin + source and index the status', () => {
+    const byName = (n: string) => MIGRATIONS.find((m) => m.name === n)!.statement;
+    const reach = byName('v013_create_reach_paths');
+    expect(reach).toContain('id VARCHAR(36) PRIMARY KEY');
+    expect(reach).toContain('signal_id VARCHAR(36) NOT NULL');
+    expect(reach).toContain('UNIQUE KEY uq_reach_signal (signal_id)');
+    expect(reach).toContain('KEY idx_reach_incident (incident_key)');
+    expect(reach).toContain('computed_at TIMESTAMP');
+    const routes = byName('v014_create_routes');
+    expect(routes).toContain('id VARCHAR(36) PRIMARY KEY');
+    expect(routes).toContain('UNIQUE KEY uq_route_origin_source (origin_incident_key, source_type, source_key)');
+    expect(routes).toContain('KEY idx_routes_status (status)');
+    expect(routes).toContain("status VARCHAR(16) NOT NULL DEFAULT 'proposed'");
+    expect(routes).toContain('decided_by VARCHAR(128) NULL');
+    expect(routes).toContain('activated_at TIMESTAMP NULL');
   });
 
   it('signals dedup per incident + event and index the status; decisions keep the decider; candidates get score_error', () => {

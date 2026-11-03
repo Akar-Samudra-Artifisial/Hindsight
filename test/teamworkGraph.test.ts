@@ -143,3 +143,41 @@ describe('deleteObjects', () => {
     expect(await deleteObjects('conn-1', 'atlassian:document', ['x'])).toEqual({ success: false, error: 'preview down' });
   });
 });
+
+describe('createTeamLookup', () => {
+  it('teamsOf reads atlassianUserInTeams for any account id, parses teams and caches per lookup', async () => {
+    const { createTeamLookup } = await import('../src/adapters/teamworkGraph');
+    const run = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      data: { atlassianUserInTeams: { edges: [{ node: { __typename: 'AtlassianTeam', id: 'ari:cloud:identity::team/t1', displayName: 'Arkana Payments' } }, { node: { __typename: 'Other' } }, { node: null }] } },
+    });
+    const lookup = createTeamLookup(CLOUD, run);
+    const [a, b] = await Promise.all([lookup.teamsOf('acc-2'), lookup.teamsOf('acc-2')]);
+    expect(a).toEqual({ ok: true, status: 200, teams: [{ id: 'ari:cloud:identity::team/t1', name: 'Arkana Payments' }] });
+    expect(b).toBe(a);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run).toHaveBeenCalledWith(CLOUD, expect.stringContaining('atlassianUserInTeams'), { userId: 'ari:cloud:identity::user/acc-2' }, 'hindsight_userTeams');
+  });
+
+  it('teamsOf passes failures through and flags an unexpected shape', async () => {
+    const { createTeamLookup } = await import('../src/adapters/teamworkGraph');
+    const run = vi.fn().mockResolvedValueOnce({ ok: false, status: 403, error: 'HTTP 403' }).mockResolvedValueOnce({ ok: true, status: 200, data: {} });
+    const lookup = createTeamLookup(CLOUD, run);
+    expect(await lookup.teamsOf('acc-1')).toEqual({ ok: false, status: 403, error: 'HTTP 403' });
+    expect(await lookup.teamsOf('acc-2')).toEqual({ ok: false, status: 200, error: 'unexpected atlassianUserInTeams shape' });
+  });
+
+  it('contributorsOf queries the page ARI and returns unique account ids', async () => {
+    const { createTeamLookup } = await import('../src/adapters/teamworkGraph');
+    const node = (accountId: string) => ({ node: { __typename: 'AtlassianUser', id: `ari:cloud:identity::user/${accountId}`, accountId } });
+    const run = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      data: { confluencePageContributors: { edges: [node('a'), node('b'), node('a')], pageInfo: { hasNextPage: true } } },
+    });
+    const lookup = createTeamLookup(CLOUD, run);
+    expect(await lookup.contributorsOf('5079131')).toEqual({ ok: true, status: 200, accountIds: ['a', 'b'], truncated: true });
+    expect(run).toHaveBeenCalledWith(CLOUD, expect.stringContaining('confluencePageContributors'), { id: `ari:cloud:confluence:${CLOUD}:page/5079131` }, 'hindsight_pageContributors');
+  });
+});

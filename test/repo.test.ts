@@ -275,9 +275,11 @@ describe('demo seed rows', () => {
     expect(rows[0]).toMatchObject({ slot: 'incident', createdByApp: true, scenarioAt: '2026-11-02T09:12:00.000Z', artifactKey: 'INC-1' });
   });
 
-  it('deleteJobsForIncident deletes decisions, signals, candidates then jobs, one statement each', async () => {
+  it('deleteJobsForIncident deletes reach paths, routes, decisions, signals, candidates then jobs, one statement each', async () => {
     await repo.deleteJobsForIncident('INC-1');
     expect(executeCalls().map((c) => c[0])).toEqual([
+      'DELETE FROM reach_paths WHERE incident_key = ?',
+      'DELETE FROM routes WHERE origin_incident_key = ?',
       'DELETE FROM signal_decisions WHERE incident_key = ?',
       'DELETE FROM signals WHERE incident_key = ?',
       'DELETE FROM signal_candidates WHERE incident_key = ?',
@@ -381,5 +383,114 @@ describe('getLatestCollectedJobForIncident', () => {
     const [statement, ...params] = queryCalls()[0]!;
     expect(statement).toContain('status IN (?, ?, ?, ?)');
     expect(params).toEqual(['INC-1', 'scoring', 'reaching', 'proposing', 'done']);
+  });
+});
+
+describe('reach paths', () => {
+  const path = (i: number, reached: boolean | null = false) => ({
+    signalId: `sig-${i}`,
+    incidentKey: 'INC-1',
+    reached,
+    hopCount: 2,
+    steps: [{ role: 'author', teamId: 't-plat', teamName: 'Arkana Platform', at: null }],
+    stopPoint: { teamId: 't-plat', teamName: 'Arkana Platform', missingLinks: 1 },
+    graphState: 'ok' as const,
+    responderTeamId: 't-pay',
+    via: 'resolver' as const,
+  });
+
+  it('upsertReachPaths is idempotent per signal and refreshes every computed column', async () => {
+    await repo.upsertReachPaths(Array.from({ length: 51 }, (_, i) => path(i, i === 0 ? null : true)));
+    expect(executeCalls()).toHaveLength(2);
+    const [statement, ...params] = executeCalls()[0]!;
+    expect(statement).toContain('INSERT INTO reach_paths');
+    expect(statement).toContain('ON DUPLICATE KEY UPDATE');
+    expect(statement).not.toMatch(/\b(id|signal_id) = /);
+    // A stored `ok` path is never replaced by pending/unknown: every column is guarded and graph_state comes last.
+    const keep = "graph_state = 'ok' AND VALUES(graph_state) <> 'ok'";
+    const updates = statement.slice(statement.indexOf('ON DUPLICATE KEY UPDATE') + 'ON DUPLICATE KEY UPDATE'.length).split(/,\s(?=\w+ = )/).map((u) => u.trim());
+    for (const u of updates) expect(u).toContain(`IF(${keep}, `);
+    expect(updates).toContain(`computed_at = IF(${keep}, computed_at, CURRENT_TIMESTAMP)`);
+    expect(updates.at(-1)).toBe(`graph_state = IF(${keep}, graph_state, VALUES(graph_state))`);
+    expect(params).toHaveLength(50 * 10);
+    expect(params.slice(1, 10)).toEqual([
+      'sig-0',
+      'INC-1',
+      null,
+      2,
+      JSON.stringify(path(0).steps),
+      JSON.stringify(path(0).stopPoint),
+      'ok',
+      't-pay',
+      'resolver',
+    ]);
+    expect(params[13]).toBe(1);
+    expect(await repo.upsertReachPaths([])).toBe(0);
+  });
+
+  it('listReachPaths maps rows (reached null stays null, JSON parsed)', async () => {
+    sql.query.mockResolvedValueOnce([
+      { id: 'r1', signal_id: 'sig-1', incident_key: 'INC-1', reached: null, hop_count: 0, steps_json: '[]', stop_point_json: null, graph_state: 'unknown', responder_team_id: null, via: 'action', computed_at: '2026-11-03 10:00:00' },
+      { id: 'r2', signal_id: 'sig-2', incident_key: 'INC-1', reached: 0, hop_count: 1, steps_json: [{ role: 'author', teamId: null, teamName: null }], stop_point_json: '{"teamId":null,"teamName":null,"missingLinks":1}', graph_state: 'ok', responder_team_id: 't', via: 'resolver', computed_at: '2026-11-03 10:00:00' },
+    ]);
+    const rows = await repo.listReachPaths('INC-1');
+    expect(queryCalls()[0]![0]).toMatch(/WHERE incident_key = \? ORDER BY signal_id ASC LIMIT 500$/);
+    expect(rows[0]).toMatchObject({ reached: null, steps: [], stopPoint: null, graphState: 'unknown', computedAt: '2026-11-03T10:00:00.000Z' });
+    expect(rows[1]).toMatchObject({ reached: false, hopCount: 1, stopPoint: { missingLinks: 1 }, responderTeamId: 't' });
+  });
+});
+
+describe('routes', () => {
+  const route = (i: number) => ({
+    originIncidentKey: 'INC-1',
+    sourceType: 'confluence_space' as const,
+    sourceKey: `SP${i}`,
+    spec: { keywords: ['vendor'], target: { teamId: 't-pay', action: 'mention' as const } },
+    reason: 'Signal stopped at Platform',
+    estimatedDaysSaved: 11.04,
+    maxDaysBefore: 12,
+    signalIds: ['sig-1'],
+    score: 11.044,
+    rankNo: i + 1,
+  });
+
+  it('upsertRoutes inserts proposed rows and never demotes or rewrites an active route', async () => {
+    await repo.upsertRoutes([route(0), route(1)]);
+    const [statement, ...params] = executeCalls()[0]!;
+    expect(statement).toContain('ON DUPLICATE KEY UPDATE');
+    const updates = statement.slice(statement.indexOf('ON DUPLICATE KEY UPDATE') + 'ON DUPLICATE KEY UPDATE'.length).split(/,\s(?=\w+ = )/);
+    for (const u of updates) expect(u.trim()).toMatch(/^(\w+) = IF\(status = 'active', \1, VALUES\(\1\)\)$/);
+    expect(statement).not.toMatch(/\bstatus = VALUES\(status\)/);
+    expect(statement).not.toMatch(/decided_by = VALUES/);
+    expect(params).toHaveLength(26);
+    expect(params.slice(1, 13)).toEqual(['INC-1', 'confluence_space', 'SP0', JSON.stringify(route(0).spec), 'Signal stopped at Platform', 11, 12, '["sig-1"]', 11.04, 'proposed', 1, null]);
+    expect(await repo.upsertRoutes([])).toBe(0);
+  });
+
+  it('listRoutes orders by rank, maps decimals and never reads decided_by', async () => {
+    sql.query.mockResolvedValueOnce([
+      { id: 'ro1', origin_incident_key: 'INC-1', source_type: 'jira_project', source_key: 'PAY', spec_json: '{"keywords":[],"target":{"teamId":"t","action":"mention"}}', reason: 'r', estimated_days_saved: '11.0', max_days_before: 12, signal_ids: '["s"]', score: '11.00', status: 'active', rank_no: 1, activated_at: '2026-11-03 10:00:00', created_at: '2026-11-03 09:00:00', updated_at: '2026-11-03 10:00:00' },
+    ]);
+    const rows = await repo.listRoutes('INC-1');
+    const statement = queryCalls()[0]![0];
+    expect(statement).toMatch(/WHERE origin_incident_key = \? ORDER BY rank_no ASC, id ASC LIMIT 50$/);
+    expect(statement).not.toContain('decided_by');
+    expect(rows[0]).toMatchObject({ estimatedDaysSaved: 11, score: 11, status: 'active', signalIds: ['s'], activatedAt: '2026-11-03T10:00:00.000Z' });
+    expect(rows[0]).not.toHaveProperty('decidedBy');
+  });
+
+  it('decideRoute is a compare-and-set that records the decider and activation time', async () => {
+    await repo.decideRoute('ro1', 'proposed', 'active', 'acc-1');
+    await repo.decideRoute('ro1', 'active', 'dismissed', 'acc-1');
+    expect(executeCalls()[0]).toEqual(['UPDATE routes SET status = ?, decided_by = ?, activated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = ?', 'active', 'acc-1', 'ro1', 'proposed']);
+    expect(executeCalls()[1]![0]).toContain('activated_at = NULL');
+  });
+});
+
+describe('deleteProposedRoutes', () => {
+  it('deletes only proposed routes of the incident, by id', async () => {
+    await repo.deleteProposedRoutes('INC-1', ['a', 'b']);
+    expect(executeCalls()[0]).toEqual(["DELETE FROM routes WHERE origin_incident_key = ? AND status = 'proposed' AND id IN (?, ?)", 'INC-1', 'a', 'b']);
+    expect(await repo.deleteProposedRoutes('INC-1', [])).toBe(0);
   });
 });

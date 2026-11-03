@@ -228,6 +228,51 @@ export const MIGRATIONS: readonly Migration[] = [
     name: 'v012_add_signal_candidates_score_error',
     statement: 'ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS score_error VARCHAR(32) NULL',
   },
+  // Who a confirmed signal reached, one row per signal. steps_json/stop_point_json hold team names and roles only,
+  // never account ids. graph_state: ok|unknown|pending; via: resolver|action|mcp.
+  {
+    name: 'v013_create_reach_paths',
+    statement: `CREATE TABLE IF NOT EXISTS reach_paths (
+      id VARCHAR(36) PRIMARY KEY,
+      signal_id VARCHAR(36) NOT NULL,
+      incident_key VARCHAR(64) NOT NULL,
+      reached TINYINT NULL,
+      hop_count INT NOT NULL DEFAULT 0,
+      steps_json JSON NOT NULL,
+      stop_point_json JSON NULL,
+      graph_state VARCHAR(16) NOT NULL,
+      responder_team_id VARCHAR(255) NULL,
+      via VARCHAR(16) NOT NULL,
+      computed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_reach_signal (signal_id),
+      KEY idx_reach_incident (incident_key)
+    )`,
+  },
+  // Proposed routing rules per (origin incident, source); status: proposed|active|dismissed. A recompute never
+  // demotes an active route. decided_by (accountId) is never sent to the UI or Rovo.
+  {
+    name: 'v014_create_routes',
+    statement: `CREATE TABLE IF NOT EXISTS routes (
+      id VARCHAR(36) PRIMARY KEY,
+      origin_incident_key VARCHAR(64) NOT NULL,
+      source_type VARCHAR(32) NOT NULL,
+      source_key VARCHAR(255) NOT NULL,
+      spec_json JSON NOT NULL,
+      reason TEXT NOT NULL,
+      estimated_days_saved DECIMAL(6,1) NOT NULL,
+      max_days_before INT NOT NULL,
+      signal_ids JSON NOT NULL,
+      score DECIMAL(8,2) NOT NULL,
+      status VARCHAR(16) NOT NULL DEFAULT 'proposed',
+      rank_no INT NOT NULL,
+      decided_by VARCHAR(128) NULL,
+      activated_at TIMESTAMP NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_route_origin_source (origin_incident_key, source_type, source_key),
+      KEY idx_routes_status (status)
+    )`,
+  },
 ];
 
 /** Name of the newest migration. */

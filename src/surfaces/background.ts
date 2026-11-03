@@ -6,7 +6,7 @@
 import { InvocationError, InvocationErrorCode, Queue } from '@forge/events';
 import { confluence, isConfluenceRateLimited } from '../adapters/confluence';
 import { isJiraRateLimited, jira } from '../adapters/jira';
-import { COLLECTED_JOB_STATUSES, repo, type ConnectionAction, type JobStatus } from '../adapters/repo';
+import { COLLECTED_JOB_STATUSES, repo, type ConnectionAction, type JobStatus, type Signal } from '../adapters/repo';
 import { ensureSchema, requestMigration, runMigrations } from '../adapters/sql';
 import { deleteObjects, writeDossier } from '../adapters/teamworkGraph';
 import { COLLECT_BUDGET_MS, COLLECT_PAGES_PER_RUN, runCollectStep, type CollectDeps } from '../core/collect';
@@ -19,8 +19,12 @@ import {
   DOSSIER_STATUS_KEY,
   parseDossierIds,
   withDossierId,
+  type DossierReach,
   type DossierStatus,
 } from '../core/dossier';
+import { computeMetrics } from '../core/reach';
+import { APP_ACCOUNTS_KEY, mergeAppAccounts, parseAppAccounts } from '../core/reachFlow';
+import { sourceTypeLabel } from '../core/routes';
 import { INCIDENT_SLOT } from '../core/demoData';
 import { analyzeLock } from '../core/jobs';
 import { SchemaSettingUpError } from '../core/schema';
@@ -178,6 +182,11 @@ const collectDeps: CollectDeps = {
   confluence: { searchContent: (cql, cursor) => confluence.searchContent(cql, cursor) },
   isRateLimited: (err) => isJiraRateLimited(err) || isConfluenceRateLimited(err),
   now: Date.now,
+  noteAppAccounts: async (ids) => {
+    const known = parseAppAccounts(await repo.getSetting<unknown>(APP_ACCOUNTS_KEY));
+    const merged = mergeAppAccounts(known, ids);
+    if (merged.length !== known.length) await repo.setSetting(APP_ACCOUNTS_KEY, merged);
+  },
 };
 
 /** True when the schema is ready; while it is setting up the caller asks for a redelivery. */
@@ -276,6 +285,21 @@ async function trackDossier(id: string): Promise<void> {
   if (!ids.includes(id)) await repo.setSetting(DOSSIER_IDS_KEY, withDossierId(ids, id));
 }
 
+/** Reach metrics and the top route for the dossier; undefined until confirmed signals were traced. */
+async function dossierReach(incidentKey: string, signals: readonly Signal[]): Promise<DossierReach | undefined> {
+  const [paths, routes] = await Promise.all([repo.listReachPaths(incidentKey), repo.listRoutes(incidentKey)]);
+  const metrics = computeMetrics(signals, paths);
+  if (!metrics || metrics.considered === 0) return undefined;
+  const top = routes.find((r) => r.status === 'active') ?? routes[0];
+  return {
+    firstSignalDays: metrics.firstSignalDays,
+    awarenessGapDays: metrics.awarenessGapDays,
+    reached: metrics.reached,
+    considered: metrics.considered,
+    topRoute: top ? { source: sourceTypeLabel(top.sourceType), estimatedDaysSaved: top.estimatedDaysSaved, maxDaysBefore: top.maxDaysBefore } : null,
+  };
+}
+
 const errorMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err)).slice(0, 300);
 
 /**
@@ -303,9 +327,9 @@ export async function writeIncidentDossier(job: { id: string; incidentKey: strin
       if (!issue?.siteUrl) throw new Error(`incident ${incidentKey} not readable by the app`);
       // After scoring: counts of signals that are not rejected. Before: kept candidates (test dossier).
       const scored = job.status === 'done';
-      const items = scored
-        ? (await repo.listSignalsForIncident(incidentKey)).filter((s) => s.status !== 'rejected')
-        : await repo.listKeptCandidates(job.id, 200);
+      const allSignals = scored ? await repo.listSignalsForIncident(incidentKey) : [];
+      const items = scored ? allSignals.filter((s) => s.status !== 'rejected') : await repo.listKeptCandidates(job.id, 200);
+      const reach = scored ? await dossierReach(incidentKey, allSignals) : undefined;
       const doc = buildDossier({
         incidentKey,
         siteUrl: issue.siteUrl,
@@ -313,6 +337,7 @@ export async function writeIncidentDossier(job: { id: string; incidentKey: strin
         candidateCount: scored ? (job.candidateCount ?? items.length) : items.length,
         earliestDaysBefore: items.length > 0 ? Math.max(...items.map((c) => c.daysBefore)) : null,
         ...(scored ? { signalCount: items.length } : {}),
+        ...(reach ? { reach } : {}),
         now: new Date(),
       });
       if (demo) await trackDossier(doc.id);

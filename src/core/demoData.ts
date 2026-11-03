@@ -91,6 +91,9 @@ const S1_PARENT = 'distractor:plat-01';
 const STORY = 'context:pay-story';
 const S2A = 'signal:s2a-jsm';
 const S2B = 'signal:s2b-jsm';
+/** "Stamp demo data": the page the admin reviews (S1's parent) and the issues they watch (story + the two S2 tickets). */
+export const STAMP_PAGE_SLOT = S1_PARENT;
+export const STAMP_WATCH_SLOTS: readonly string[] = [STORY, S2A, S2B];
 
 const SIGNALS: readonly DemoSpec[] = [
   {
