@@ -76,7 +76,12 @@ async function search(as: 'app' | 'user', params: URLSearchParams): Promise<Sear
 async function readJson<T>(res: APIResponse, what: string): Promise<T> {
   if (!res.ok) throw await failure(res, what);
   const text = await res.text();
-  return (text ? JSON.parse(text) : undefined) as T;
+  if (!text.trim()) return undefined as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`Confluence ${what} returned a response that is not JSON (${text.length} characters)`);
+  }
 }
 
 const JSON_HEADERS = { Accept: 'application/json', 'Content-Type': 'application/json' };

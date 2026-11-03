@@ -32,7 +32,7 @@ export class SeedError extends Error {}
 export interface SeedDeps {
   jira: Pick<
     JiraClient,
-    'getProject' | 'createProject' | 'issueTypes' | 'bulkCreateIssues' | 'createIssue' | 'addComment' | 'transitionToDone' | 'setIssueProperty' | 'deleteIssue' | 'countIssues'
+    'getProject' | 'serviceDeskAvailable' | 'createProject' | 'issueTypes' | 'bulkCreateIssues' | 'createIssue' | 'addComment' | 'transitionToDone' | 'setIssueProperty' | 'deleteIssue' | 'countIssues'
   >;
   confluence: Pick<
     ConfluenceClient,
@@ -161,12 +161,23 @@ export function existingContainerWarnings(artifacts: readonly Pick<DemoArtifact,
   });
 }
 
+/** Note when the INC container is not a JSM project: its customer tickets are labelled work items instead. */
+export function serviceProjectNote(a: Pick<DemoArtifact, 'slot' | 'source' | 'artifactKey' | 'createdByApp'>): string | undefined {
+  if (a.slot !== INC_SLOT || a.source === 'jsm') return undefined;
+  const key = a.artifactKey ?? DEMO.inc.key;
+  return a.createdByApp
+    ? `Jira Service Management is not available on this site; ${key} was created as a software project, and its customer tickets are work items labelled ${DEMO.customerLabel}.`
+    : `Project ${key} is not a Jira Service Management project; its customer tickets are work items labelled ${DEMO.customerLabel}.`;
+}
+
 /**
  * Notes for every demo project/space Hindsight reuses: one it did not create (warning) or one it created on an
- * earlier Load and kept through Remove. Shown on the setup page after the job, whatever its status.
+ * earlier Load and kept through Remove, plus the note of an INC without JSM. Shown on the setup page after the job,
+ * whatever its status.
  */
-export function containerNotes(artifacts: readonly Pick<DemoArtifact, 'slot' | 'artifactKey' | 'createdByApp'>[]): string[] {
+export function containerNotes(artifacts: readonly Pick<DemoArtifact, 'slot' | 'source' | 'artifactKey' | 'createdByApp'>[]): string[] {
   const warnings = existingContainerWarnings(artifacts);
+  const noJsm = artifacts.flatMap((a) => serviceProjectNote(a) ?? []);
   const kept = artifacts.flatMap((a) => {
     if (!a.createdByApp) return [];
     const key = a.artifactKey ?? '';
@@ -174,32 +185,123 @@ export function containerNotes(artifacts: readonly Pick<DemoArtifact, 'slot' | '
     if (a.slot === SPACE_SLOT) return [`Space ${key} was created by Hindsight for the demo; Remove demo data keeps it.`];
     return [];
   });
-  return [...warnings, ...kept];
+  return [...warnings, ...noJsm, ...kept];
+}
+
+/**
+ * Splits the recorded artifacts into the ones whose demo project/space still exists and the containers deleted
+ * outside Hindsight (a failed check keeps the container), so the setup page never reports a deleted project as
+ * "created by Hindsight". Load demo data recreates the missing ones.
+ */
+export async function checkContainers(
+  artifacts: readonly DemoArtifact[],
+  deps: { jira: Pick<SeedDeps['jira'], 'getProject'>; confluence: Pick<SeedDeps['confluence'], 'findSpace'> },
+): Promise<{ present: DemoArtifact[]; missingNotes: string[] }> {
+  const containers = artifacts.filter((a) => a.slot === PAY_SLOT || a.slot === INC_SLOT || a.slot === SPACE_SLOT);
+  const missing = new Set<string>();
+  await Promise.all(
+    containers.map(async (a) => {
+      try {
+        const exists =
+          a.slot === SPACE_SLOT
+            ? (await deps.confluence.findSpace(a.artifactKey ?? DEMO.space.key))?.id === a.artifactId
+            : (await deps.jira.getProject(a.artifactKey ?? a.artifactId)) !== undefined;
+        if (!exists) missing.add(a.slot);
+      } catch (err) {
+        console.warn('demo: container check failed', { slot: a.slot, error: messageOf(err) });
+      }
+    }),
+  );
+  const missingNotes = containers
+    .filter((a) => missing.has(a.slot))
+    .map((a) => `${a.slot === SPACE_SLOT ? 'Space' : 'Project'} ${a.artifactKey ?? ''} no longer exists; Load demo data will create it again.`);
+  return { present: artifacts.filter((a) => !missing.has(a.slot)), missingNotes };
 }
 
 // --- Containers -----------------------------------------------------------------------------------
 
+/** INC as a software project (same template as PAY) on a site without Jira Service Management. */
+const INC_SOFTWARE = { ...DEMO.inc, projectTypeKey: DEMO.pay.projectTypeKey, projectTemplateKey: DEMO.pay.projectTemplateKey };
+type ProjectDef = typeof DEMO.pay | typeof DEMO.inc | typeof INC_SOFTWARE;
+
+/** Jira 400 for a project type the site does not have (`projectType: An invalid project type was specified...`). */
+const projectTypeUnavailable = (err: unknown): boolean => statusOf(err) === 400 && /project ?type/i.test(messageOf(err));
+/** Jira 400 for a key still held by another (possibly trashed) project. */
+const keyTaken = (err: unknown): boolean => statusOf(err) === 400 && /key/i.test(messageOf(err)) && /(exist|in use|already|taken)/i.test(messageOf(err));
+
+/**
+ * Forgets a container whose project or space was deleted outside Hindsight, together with every slot inside it
+ * (their artifacts went with it) and their scenario rows, so the next steps create them again.
+ */
+async function forgetContainer(slot: string, slots: Slots, deps: SeedDeps): Promise<void> {
+  const inside = (a: DemoArtifact): boolean => {
+    const base = a.slot.endsWith(CLOSED_SUFFIX) ? a.slot.slice(0, -CLOSED_SUFFIX.length) : a.slot;
+    if (slot === SPACE_SLOT) return a.source === 'confluence';
+    if (slot === INC_SLOT && base === INCIDENT_SLOT) return true;
+    const spec = SPEC_BY_SLOT.get(base);
+    const project = spec ? projectOf(spec) : undefined;
+    return project !== undefined && containerSlot(project) === slot;
+  };
+  const gone = slots.all().filter((a) => a.slot !== slot && inside(a));
+  console.warn('demo: container was deleted outside Hindsight, recreating it', { slot, forgotten: gone.length });
+  const refs = gone.filter((a) => !a.slot.endsWith(CLOSED_SUFFIX)).map((a): EventRef => ({ source: a.source, artifactId: a.artifactId, commentId: a.commentId }));
+  if (refs.length > 0) await deps.repo.deleteEventsByRefs(refs);
+  const incidentKey = gone.find((a) => a.slot === INCIDENT_SLOT)?.artifactKey;
+  if (incidentKey) {
+    await deps.repo.deleteJobsForIncident(incidentKey);
+    await deps.repo.deleteIncident(incidentKey);
+    await deps.repo.releaseAppLock(analyzeLock(incidentKey));
+  }
+  await slots.drop([slot, ...gone.map((a) => a.slot)]);
+}
+
+/** A refused project creation as a SeedError with the manual fallback; any other error unchanged. */
+function explainRefusal(def: ProjectDef, err: unknown): unknown {
+  if (!refused(err)) return err;
+  console.warn('demo: project creation refused', { key: def.key, projectTypeKey: def.projectTypeKey, status: statusOf(err), error: messageOf(err) });
+  const manual = keyTaken(err)
+    ? `The project key ${def.key} is still taken, possibly by a deleted project in the Jira trash. Delete that project permanently (Jira settings → Projects → Trash), then click Load demo data again.`
+    : def.projectTypeKey === 'service_desk'
+      ? `Create a Jira Service Management project with key ${def.key} (IT service management template), then click Load demo data again.`
+      : `Create a Jira software project with key ${def.key}, then click Load demo data again.`;
+  return new SeedError(`${manual} (Jira said: ${messageOf(err)})`);
+}
+
+/** Creates the project; INC falls back to a software project when Jira refuses the service project type. */
+async function createDemoProject(def: ProjectDef, accountId: string, deps: SeedDeps): Promise<ProjectDef> {
+  try {
+    await deps.jira.createProject({ ...def, leadAccountId: accountId });
+    return def;
+  } catch (err) {
+    if (!(def.projectTypeKey === 'service_desk' && projectTypeUnavailable(err))) throw explainRefusal(def, err);
+    console.warn('demo: service project type refused, creating INC as a software project', { error: messageOf(err) });
+  }
+  try {
+    await deps.jira.createProject({ ...INC_SOFTWARE, leadAccountId: accountId });
+    return INC_SOFTWARE;
+  } catch (err) {
+    throw explainRefusal(INC_SOFTWARE, err);
+  }
+}
+
 async function ensureProject(project: DemoProject, accountId: string, slots: Slots, deps: SeedDeps, counts: SeedCounts): Promise<DemoArtifact> {
   const slot = containerSlot(project);
   const known = slots.get(slot);
-  if (known) return known;
-  const def = project === 'PAY' ? DEMO.pay : DEMO.inc;
+  if (known) {
+    if (await deps.jira.getProject(known.artifactKey ?? known.artifactId)) return known;
+    await forgetContainer(slot, slots, deps);
+  }
+  let def: ProjectDef = project === 'PAY' ? DEMO.pay : DEMO.inc;
   let info = await deps.jira.getProject(def.key);
   let createdByApp = false;
   if (info) {
     console.info('demo: using existing Jira project', { key: def.key, projectTypeKey: info.projectTypeKey });
   } else {
-    try {
-      await deps.jira.createProject({ ...def, leadAccountId: accountId });
-    } catch (err) {
-      if (!refused(err)) throw err;
-      console.warn('demo: project creation refused', { key: def.key, status: statusOf(err), error: messageOf(err) });
-      const manual =
-        project === 'INC'
-          ? `Create a Jira Service Management project with key ${def.key} (IT service management template), then click Load demo data again.`
-          : `Create a Jira software project with key ${def.key}, then click Load demo data again.`;
-      throw new SeedError(`${manual} (Jira said: ${messageOf(err)})`);
+    if (project === 'INC' && (await deps.jira.serviceDeskAvailable()) === false) {
+      console.warn('demo: Jira Service Management is not available, creating INC as a software project');
+      def = INC_SOFTWARE;
     }
+    def = await createDemoProject(def, accountId, deps);
     info = await deps.jira.getProject(def.key);
     if (!info) throw new SeedError(`Jira project ${def.key} was created but cannot be read yet. Click Load demo data again.`);
     createdByApp = true;
@@ -221,7 +323,10 @@ async function ensureProject(project: DemoProject, accountId: string, slots: Slo
 
 async function ensureSpace(slots: Slots, deps: SeedDeps, counts: SeedCounts): Promise<DemoArtifact> {
   const known = slots.get(SPACE_SLOT);
-  if (known) return known;
+  if (known) {
+    if ((await deps.confluence.findSpace(known.artifactKey ?? DEMO.space.key))?.id === known.artifactId) return known;
+    await forgetContainer(SPACE_SLOT, slots, deps);
+  }
   const { key, name, description } = DEMO.space;
   let space = await deps.confluence.findSpace(key);
   let createdByApp = false;
@@ -266,7 +371,8 @@ async function createIssues(project: DemoArtifact, specs: readonly IssueSpec[], 
   for (const s of missing) byType.set(s.issueType, [...(byType.get(s.issueType) ?? []), s]);
   for (const [issueType, group] of byType) {
     const typeId = await typeIdFor(project, issueType, deps, types);
-    const items = group.map((s) => ({ summary: s.title, description: adfParagraphs(s.body), labels: [DEMO.label] }));
+    const labels = issueType === 'request' ? [DEMO.label, DEMO.customerLabel] : [DEMO.label];
+    const items = group.map((s) => ({ summary: s.title, description: adfParagraphs(s.body), labels }));
     let created: ({ id: string; key: string } | undefined)[];
     try {
       created = await deps.jira.bulkCreateIssues(key, typeId, items);
@@ -536,6 +642,8 @@ export async function loadDemoData(accountId: string, deps: SeedDeps): Promise<L
   if (!(await step(2, `Preparing service project ${DEMO.inc.key}`))) return partial();
   const inc = await ensureProject('INC', accountId, slots, deps, created);
   await warnIfExisting(2, inc);
+  const noJsm = serviceProjectNote(inc);
+  if (noJsm) await deps.progress(2, LOAD_STEPS, noJsm);
   if (!(await step(3, `Preparing Confluence space ${DEMO.space.key}`))) return partial();
   const space = await ensureSpace(slots, deps, created);
   await warnIfExisting(3, space);

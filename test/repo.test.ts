@@ -35,6 +35,9 @@ describe('column helpers', () => {
   it('parses JSON columns that arrive as text or as values', () => {
     expect(parseJsonColumn<string[]>('["a"]')).toEqual(['a']);
     expect(parseJsonColumn<string[]>(['a'])).toEqual(['a']);
+    // Regression (production Load demo data): a JSON string setting returned unquoted by Forge SQL.
+    expect(parseJsonColumn<string>('2026-11-02T08:51:00.000Z')).toBe('2026-11-02T08:51:00.000Z');
+    expect(parseJsonColumn<string>('"2026-11-02T08:51:00.000Z"')).toBe('2026-11-02T08:51:00.000Z');
   });
 
   it('sqlInt truncates, clamps and rejects non-finite values', () => {

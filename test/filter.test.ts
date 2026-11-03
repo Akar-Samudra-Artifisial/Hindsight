@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { daysBefore, filterEvent, isUnansweredQuestion, rankCandidates, type CollectedEvent, type IncidentContext } from '../src/core/filter';
+import { CUSTOMER_TICKET_LABEL, daysBefore, filterEvent, isCustomerTicket, isUnansweredQuestion, rankCandidates, type CollectedEvent, type IncidentContext } from '../src/core/filter';
 import { extractKeywords } from '../src/core/keywords';
 
 const START = '2026-11-20T10:00:00.000Z';
@@ -75,6 +75,23 @@ describe('filterEvent: the three Arkana signals pass', () => {
     );
     expect(d).toMatchObject({ daysBefore: 6, hintType: 'customer_complaint' });
     expect(d?.reasons).toContain('jsm_closed_without_fix');
+  });
+
+  it('without JSM: a Jira work item labelled as a customer ticket scores like a JSM ticket', () => {
+    const ticket = {
+      projectKey: 'INC',
+      title: 'Payment fails at checkout',
+      text: 'My card payment failed twice at checkout this morning.',
+      statusCategory: 'done',
+      effectiveAt: daysAgo(6),
+    };
+    const labelled = filterEvent(ev({ ...ticket, labels: ['hindsight-demo', CUSTOMER_TICKET_LABEL] }), ctx);
+    const jsm = filterEvent(ev({ ...ticket, source: 'jsm', labels: ['hindsight-demo'] }), ctx);
+    expect(labelled).toMatchObject({ hintType: 'customer_complaint', filterScore: jsm?.filterScore });
+    expect(labelled?.reasons).toContain('jsm_closed_without_fix');
+    const plain = filterEvent(ev({ ...ticket, labels: ['hindsight-demo'] }), ctx);
+    expect(plain?.hintType).toBe('technical_warning');
+    expect(isCustomerTicket({ source: 'confluence', labels: [CUSTOMER_TICKET_LABEL] })).toBe(false);
   });
 
   it('unanswered question about 426, 3 days before', () => {

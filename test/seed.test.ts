@@ -2,11 +2,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DemoArtifact, DemoArtifactInput, ScenarioEventInput, ServiceMapping } from '../src/adapters/repo';
 import { DEMO, DEMO_ARTIFACTS } from '../src/core/demoData';
 import { DOSSIER_IDS_KEY } from '../src/core/dossier';
-import { containerNotes, existingContainerWarnings, INC_SLOT, loadDemoData, PAY_SLOT, removeDemoData, resetShowcase, SeedError, SPACE_SLOT, T0_SETTING, type SeedDeps } from '../src/core/seed';
+import { checkContainers, containerNotes, existingContainerWarnings, INC_SLOT, loadDemoData, PAY_SLOT, removeDemoData, resetShowcase, SeedError, SPACE_SLOT, T0_SETTING, type SeedDeps } from '../src/core/seed';
 
 const NOW = Date.parse('2026-11-03T10:00:00.000Z');
 
-function fakeWorld(opts: { existingPageTitle?: string; incRefused?: boolean } = {}) {
+function fakeWorld(opts: { existingPageTitle?: string; incRefused?: boolean; noJsm?: 'checked' | 'refused' } = {}) {
   let nextId = 1000;
   const calls: string[] = [];
   const projects = new Map<string, { id: string; key: string; name: string; projectTypeKey: string }>();
@@ -16,6 +16,8 @@ function fakeWorld(opts: { existingPageTitle?: string; incRefused?: boolean } = 
   const settings = new Map<string, unknown>();
   const events: ScenarioEventInput[] = [];
   const mappings: ServiceMapping[] = [];
+  const issueLog: { projectKey: string; type: string; summary: string; labels: string[] }[] = [];
+  const spaces = new Map<string, { id: string; key: string }>();
   const newIssue = (projectKey: string, summary: string) => {
     counters[projectKey] = (counters[projectKey] ?? 0) + 1;
     const issue = { id: String(nextId++), key: `${projectKey}-${counters[projectKey]}`, summary };
@@ -26,15 +28,19 @@ function fakeWorld(opts: { existingPageTitle?: string; incRefused?: boolean } = 
 
   const jira: SeedDeps['jira'] = {
     getProject: vi.fn(async (key: string) => projects.get(key)),
+    serviceDeskAvailable: vi.fn(async () => (opts.noJsm === 'checked' ? false : opts.noJsm === 'refused' ? undefined : true)),
     createProject: vi.fn(async (input) => {
       if (opts.incRefused && input.key === 'INC') throw Object.assign(new Error('Jira 403: You do not have permission'), { status: 403 });
+      if (opts.noJsm && input.projectTypeKey === 'service_desk') {
+        throw Object.assign(new Error('Jira 400: projectType: An invalid project type was specified. Make sure the project type is available in your Jira instance.'), { status: 400 });
+      }
       const p = { id: String(nextId++), key: input.key, name: input.name, projectTypeKey: input.projectTypeKey };
       projects.set(input.key, p);
       calls.push(`project:${input.key}`);
       return { id: p.id, key: p.key };
     }),
     issueTypes: vi.fn(async (key: string) =>
-      key === 'INC'
+      projects.get(key)?.projectTypeKey === 'service_desk'
         ? [
             { id: '1', name: '[System] Incident' },
             { id: '2', name: '[System] Service request' },
@@ -42,10 +48,19 @@ function fakeWorld(opts: { existingPageTitle?: string; incRefused?: boolean } = 
         : [
             { id: '10', name: 'Task' },
             { id: '11', name: 'Story' },
+            { id: '12', name: 'Bug' },
           ],
     ),
-    bulkCreateIssues: vi.fn(async (projectKey: string, _type: string, items) => items.map((i: { summary: string }) => newIssue(projectKey, i.summary))),
-    createIssue: vi.fn(async (projectKey: string, _type: string, item) => newIssue(projectKey, item.summary)),
+    bulkCreateIssues: vi.fn(async (projectKey: string, type: string, items) =>
+      items.map((i: { summary: string; labels: string[] }) => {
+        issueLog.push({ projectKey, type, summary: i.summary, labels: i.labels });
+        return newIssue(projectKey, i.summary);
+      }),
+    ),
+    createIssue: vi.fn(async (projectKey: string, type: string, item) => {
+      issueLog.push({ projectKey, type, summary: item.summary, labels: item.labels });
+      return newIssue(projectKey, item.summary);
+    }),
     addComment: vi.fn(async (key: string) => {
       calls.push(`comment:${key}`);
       return { id: String(nextId++) };
@@ -62,8 +77,13 @@ function fakeWorld(opts: { existingPageTitle?: string; incRefused?: boolean } = 
   };
   const pages = new Map<string, string>();
   const confluence: SeedDeps['confluence'] = {
-    findSpace: vi.fn(async () => undefined),
-    createSpace: vi.fn(async (key: string) => ({ id: '77', key })),
+    findSpace: vi.fn(async (key: string) => spaces.get(key)),
+    createSpace: vi.fn(async (key: string) => {
+      const space = { id: String(nextId++), key };
+      spaces.set(key, space);
+      calls.push(`space:${key}`);
+      return space;
+    }),
     findPageByTitle: vi.fn(async (_space: string, title: string) => (title === opts.existingPageTitle ? { id: '555', webUrl: 'https://x/wiki/555' } : undefined)),
     createPage: vi.fn(async (_space: string, title: string) => {
       const id = String(nextId++);
@@ -133,7 +153,7 @@ function fakeWorld(opts: { existingPageTitle?: string; incRefused?: boolean } = 
     indexWaitMs: 180_000,
     progress: vi.fn(async () => undefined),
   };
-  return { deps, calls, artifacts, settings, events, projects, mappings };
+  return { deps, calls, artifacts, settings, events, projects, mappings, spaces, issueLog };
 }
 
 beforeEach(() => {
@@ -382,6 +402,80 @@ describe('closing demo issues', () => {
       expect.objectContaining({ slot: 'signal:s2a-jsm', available: ['Respond → Waiting for customer'] }),
     );
     expect(r.closures.find((c) => c.slot === 'signal:s2b-jsm')).toMatchObject({ outcome: 'not closed', available: ['Respond → Waiting for customer'] });
+  });
+});
+
+describe('site without Jira Service Management', () => {
+  const NOTE = `Jira Service Management is not available on this site; INC was created as a software project, and its customer tickets are work items labelled ${DEMO.customerLabel}.`;
+
+  it.each(['checked', 'refused'] as const)('creates INC as a software project (%s) and keeps the four signals as customer tickets', async (noJsm) => {
+    const w = fakeWorld({ noJsm });
+    const r = await loadDemoData('acc-1', w.deps);
+    expect(r).toMatchObject({ complete: true, incidentKey: 'INC-15' });
+    const incCreates = vi.mocked(w.deps.jira.createProject).mock.calls.map((c) => c[0]).filter((p) => p.key === 'INC');
+    expect(incCreates.at(-1)).toMatchObject({ projectTypeKey: 'software', projectTemplateKey: DEMO.pay.projectTemplateKey });
+    expect(incCreates).toHaveLength(noJsm === 'checked' ? 1 : 2);
+    expect(w.artifacts.get(INC_SLOT)).toMatchObject({ source: 'jira', createdByApp: true });
+    for (const title of ['Payment fails at checkout', 'Checkout says payment could not be completed']) {
+      expect(w.issueLog.find((i) => i.summary === title)).toMatchObject({ projectKey: 'INC', type: '10', labels: [DEMO.label, DEMO.customerLabel] });
+    }
+    expect(w.issueLog.find((i) => i.summary === DEMO.incident.summary)).toMatchObject({ type: '12' });
+    expect(w.calls.filter((c) => c.endsWith(':Cannot Reproduce'))).toHaveLength(2);
+    expect(w.events.filter((e) => e.projectKey === 'INC').every((e) => e.source === 'jira')).toBe(true);
+    expect(w.deps.progress).toHaveBeenCalledWith(2, 10, NOTE);
+    expect(containerNotes([...w.artifacts.values()])).toContain(NOTE);
+  });
+
+  it('a project key still held by a trashed project gives an actionable message', async () => {
+    const w = fakeWorld();
+    w.deps.jira.createProject = vi.fn(async () => Promise.reject(Object.assign(new Error('Jira 400: projectKey: A project with that project key already exists.'), { status: 400 })));
+    await expect(loadDemoData('acc-1', w.deps)).rejects.toThrow(/key PAY is still taken.*Trash/);
+  });
+});
+
+describe('demo containers deleted outside Hindsight', () => {
+  it('recreates a deleted project and its issues instead of treating the recorded slot as present', async () => {
+    const w = fakeWorld();
+    await loadDemoData('acc-1', w.deps);
+    const payIssues = DEMO_ARTIFACTS.filter((s) => s.kind === 'issue' && s.project === 'PAY').length;
+    w.projects.delete('PAY');
+    const r = await loadDemoData('acc-1', w.deps);
+    expect(r.complete).toBe(true);
+    expect(r.created).toMatchObject({ projects: 1, spaces: 0, issues: payIssues, pages: 0 });
+    expect(w.artifacts.get(PAY_SLOT)?.artifactId).toBe(w.projects.get('PAY')?.id);
+    expect(w.deps.repo.deleteEventsByRefs).toHaveBeenCalled();
+    expect(w.deps.repo.deleteIncident).not.toHaveBeenCalled();
+  });
+
+  it('a deleted INC forgets the old incident and creates a new one', async () => {
+    const w = fakeWorld();
+    await loadDemoData('acc-1', w.deps);
+    w.projects.delete('INC');
+    const r = await loadDemoData('acc-1', w.deps);
+    expect(w.deps.repo.deleteIncident).toHaveBeenCalledWith('INC-15');
+    expect(r.closures.map((c) => c.outcome)).toEqual(['closed', 'closed', 'closed']);
+    expect(r.created.projects).toBe(1);
+    expect(r.incidentKey).toMatch(/^INC-/);
+  });
+
+  it('checkContainers: a deleted project is not reported as created by Hindsight, only as missing', async () => {
+    const w = fakeWorld();
+    await loadDemoData('acc-1', w.deps);
+    w.projects.delete('PAY');
+    w.deps.confluence.findSpace = vi.fn(async () => Promise.reject(new Error('Confluence 500')));
+    const { present, missingNotes } = await checkContainers([...w.artifacts.values()], w.deps);
+    expect(missingNotes).toEqual(['Project PAY no longer exists; Load demo data will create it again.']);
+    expect(present.some((a) => a.slot === PAY_SLOT)).toBe(false);
+    expect(present.some((a) => a.slot === SPACE_SLOT)).toBe(true);
+    expect(containerNotes(present).some((n) => n.startsWith('Project PAY'))).toBe(false);
+  });
+
+  it('recreates a deleted space and its pages', async () => {
+    const w = fakeWorld();
+    await loadDemoData('acc-1', w.deps);
+    w.spaces.delete('PLAT');
+    const r = await loadDemoData('acc-1', w.deps);
+    expect(r.created).toMatchObject({ projects: 0, spaces: 1, issues: 0, pages: PAGE_SPECS });
   });
 });
 

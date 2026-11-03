@@ -5,10 +5,18 @@ import { execute, query } from './sql';
 
 type Row = Record<string, unknown>;
 
-/** Forge SQL may return JSON columns as a string or as an already-parsed value. */
+/**
+ * Forge SQL may return JSON columns as JSON text or as an already-parsed value. A JSON string scalar can come back
+ * already unquoted (production: the ISO `demo_t0` setting read as `2026-11-02T…`, which `JSON.parse` rejects at
+ * position 4), so text that is not valid JSON is the value itself.
+ */
 export function parseJsonColumn<T>(raw: unknown): T {
-  if (typeof raw === 'string') return JSON.parse(raw) as T;
-  return raw as T;
+  if (typeof raw !== 'string') return raw as T;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return raw as T;
+  }
 }
 
 /** ISO timestamp → MySQL `YYYY-MM-DD HH:MM:SS` (UTC). */

@@ -9,7 +9,7 @@ vi.mock('@forge/api', async (importOriginal) => {
   };
 });
 
-const { isJiraRateLimited, jira, JiraError, pickDoneTransition, siteBaseFromSelf } = await import('../src/adapters/jira');
+const { isJiraRateLimited, jira, JiraError, parseBody, pickDoneTransition, siteBaseFromSelf } = await import('../src/adapters/jira');
 
 const reply = (status: number, body: unknown) => ({ ok: status >= 200 && status < 300, status, text: async () => (body === undefined ? '' : JSON.stringify(body)) });
 const pathOf = (call: unknown[]) => (call[0] as { value: string }).value;
@@ -138,6 +138,24 @@ describe('demo seed and admin calls', () => {
     await jira.setIssueProperty('INC-1', 'hindsight', { serviceKey: 'checkout' });
     expect((api.appRequest.mock.calls[0] as unknown[])[1]).toMatchObject({ method: 'PUT' });
     expect(await jira.getProject('INC')).toEqual({ id: '7', key: 'INC', name: 'Arkana Support', projectTypeKey: 'service_desk' });
+  });
+
+  it('a non-JSON 2xx body fails with the endpoint, not a bare SyntaxError', async () => {
+    api.appRequest.mockResolvedValueOnce({ ok: true, status: 200, text: async () => '2026-11-02 not json' });
+    await expect(jira.getProject('PAY')).rejects.toThrow('Jira GET /rest/api/3/project/PAY returned a response that is not JSON (19 characters)');
+    expect(parseBody('  ', 'GET /x')).toBeUndefined();
+  });
+
+  it('serviceDeskAvailable: 200 → true, 404 → false, other failures → undefined', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    api.appRequest
+      .mockResolvedValueOnce(reply(200, { key: 'service_desk' }))
+      .mockResolvedValueOnce(reply(404, { errorMessages: ['not found'] }))
+      .mockResolvedValueOnce(reply(401, { message: 'scope does not match' }));
+    expect(await jira.serviceDeskAvailable()).toBe(true);
+    expect(pathOf(api.appRequest.mock.calls[0] as unknown[])).toBe('/rest/api/3/project/type/service_desk/accessible');
+    expect(await jira.serviceDeskAvailable()).toBe(false);
+    expect(await jira.serviceDeskAvailable()).toBeUndefined();
   });
 });
 
