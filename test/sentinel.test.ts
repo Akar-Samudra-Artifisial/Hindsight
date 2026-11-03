@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { Route } from '../src/adapters/repo';
+import { lockName, type Route } from '../src/adapters/repo';
 import {
   alertGate,
   buildAlertComment,
@@ -9,7 +9,10 @@ import {
   matchedKeywords,
   matchRoutes,
   MAX_FAILED_POSTS,
+  NOT_INDEXED_DELAYS_SECONDS,
   noticeText,
+  notIndexedDelay,
+  sentinelChainLock,
   parseDailyCap,
   parseSentinelBody,
   parseWeeklyCap,
@@ -99,6 +102,13 @@ describe('sentinel queue body', () => {
     expect(() => parseSentinelBody({ ...body, source: 'jira' })).toThrow(/artifactId/);
     expect(() => parseSentinelBody({ ...body, commentId: '1; DROP' })).toThrow();
     expect(sentinelLock(body)).toBe('sentinel:confluence.0.901');
+    expect(sentinelChainLock(body)).toBe('sentinel-chain:confluence.0.901');
+    expect(lockName(sentinelChainLock({ source: 'confluence', artifactId: '123456789012345678', commentId: '123456789012345678' }))).toBeTruthy();
+  });
+
+  it('notIndexedDelay: 60, 90, then 120 s, six re-queues in all (~10.5 min, each ≤ 900 s)', () => {
+    expect([1, 2, 3, 4, 5, 6, 7].map(notIndexedDelay)).toEqual([60, 90, 120, 120, 120, 120, null]);
+    expect(NOT_INDEXED_DELAYS_SECONDS.reduce((a, b) => a + b, 0)).toBe(630);
   });
 });
 

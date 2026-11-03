@@ -315,7 +315,8 @@ const NOTICE_SLOT = /^notice:([0-9]{1,6})$/;
  * Setup, admin only (demo): posts "Provider notice #n" with the keywords of the active PLAT route as a comment by
  * the admin on the demo PLAT page, so Sentinel runs its real path on a human-written artifact. The comment is
  * recorded as demo slot `notice:<n>`. A delayed copy is queued for the consumer too, in case the comment event is
- * marked self-generated; a double delivery is caught by the lifetime dedup.
+ * marked self-generated; when the product event did arrive, the copy finds that artifact's retry chain running and
+ * is skipped (`chain_active`), and the lifetime dedup still allows only one alert.
  */
 resolver.define('postProviderNotice', async ({ context }) =>
   guarded(async () => {

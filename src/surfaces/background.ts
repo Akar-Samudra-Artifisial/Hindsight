@@ -30,12 +30,15 @@ import {
   isSelfArtifact,
   matchRoutes,
   MAX_SENTINEL_ATTEMPTS,
+  notIndexedDelay,
   parseDailyCap,
   parseSentinelBody,
   parseWeeklyCap,
   parseWorkEvent,
   prefilter,
   sentinelBody,
+  SENTINEL_CHAIN_SECONDS,
+  sentinelChainLock,
   sentinelLock,
   SENTINEL_DAILY_CAP_KEY,
   SENTINEL_QUEUE,
@@ -782,7 +785,8 @@ async function runSentinel(b: SentinelBody): Promise<SentinelOutcome> {
  * Consumer for the `sentinel` queue: under a per-artifact lock it reads the artifact as the app, skips app-written
  * artifacts, matches active routes and posts at most one heads-up per team (lifetime dedup per route and artifact
  * or comment, bounded failure retries, weekly cap per team, daily cap overall). 429 → re-queued after 60 s with
- * `attempt + 1`, at most 3 attempts.
+ * `attempt + 1`, at most 3 attempts; a comment not indexed yet → re-queued on `NOT_INDEXED_DELAYS_SECONDS` (~10 min).
+ * Only one retry chain per artifact runs (`sentinelChainLock`); a second attempt-1 delivery is skipped.
  */
 export async function checkSentinel(event: QueueEvent | undefined): Promise<InvocationError | void> {
   let body: SentinelBody;
@@ -795,7 +799,15 @@ export async function checkSentinel(event: QueueEvent | undefined): Promise<Invo
   if (!(await schemaReady('checkSentinel'))) return retryLater(SCHEMA_RETRY_SECONDS, 'schema');
   const lock = sentinelLock(body);
   if (!(await repo.acquireAppLock(lock, new Date().toISOString(), SENTINEL_LOCK_SECONDS))) return retryLater(SCHEMA_RETRY_SECONDS, 'locked');
+  const chain = sentinelChainLock(body);
+  // Re-queued deliveries (attempt > 1) belong to the chain that is already running.
+  let ownsChain = body.attempt > 1;
+  let requeued = false;
   try {
+    if (!ownsChain) {
+      ownsChain = await repo.acquireAppLock(chain, new Date().toISOString(), SENTINEL_CHAIN_SECONDS);
+      if (!ownsChain) return skipped('chain_active', { source: body.source, kind: body.kind });
+    }
     let outcome: SentinelOutcome;
     try {
       outcome = await runSentinel(body);
@@ -811,15 +823,19 @@ export async function checkSentinel(event: QueueEvent | undefined): Promise<Invo
       console.info('sentinel done', { source: body.source, kind: body.kind, posted: outcome.posted });
       return;
     }
-    // 429, or a comment the search index does not have yet: re-queued after 60 s, at most 3 attempts.
+    // 429: 60 s, at most 3 attempts. Not indexed yet: the longer schedule (~10 min).
     const why = outcome.status === 'not_indexed' ? 'not indexed yet' : 'rate limited';
-    if (body.attempt >= MAX_SENTINEL_ATTEMPTS) {
+    const delay = outcome.status === 'not_indexed' ? notIndexedDelay(body.attempt) : body.attempt < MAX_SENTINEL_ATTEMPTS ? RATE_LIMIT_DELAY_SECONDS : null;
+    if (delay === null) {
       console.warn(`sentinel: ${why}, gave up`, { attempt: body.attempt });
       return;
     }
-    await enqueueSentinel({ ...body, attempt: body.attempt + 1 }, RATE_LIMIT_DELAY_SECONDS);
-    console.warn(`sentinel: ${why}, re-queued`, { attempt: body.attempt });
+    await enqueueSentinel({ ...body, attempt: body.attempt + 1 }, delay);
+    requeued = true;
+    console.warn(`sentinel: ${why}, re-queued`, { attempt: body.attempt, delayInSeconds: delay });
   } finally {
+    // The chain ends unless it was re-queued; its lock is freed so a later event on the artifact can run again.
+    if (ownsChain && !requeued) await repo.releaseAppLock(chain);
     await repo.releaseAppLock(lock);
   }
 }

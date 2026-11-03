@@ -20,7 +20,25 @@ export const MAX_WEEKLY_CAP = 1000;
 export const SENTINEL_DAILY_CAP_KEY = 'sentinel_daily_cap';
 export const DEFAULT_DAILY_CAP = 200;
 export const MAX_DAILY_CAP = 5000;
+/** 429: at most this many deliveries, 60 s apart. */
 export const MAX_SENTINEL_ATTEMPTS = 3;
+/**
+ * A Confluence comment the search index does not have yet (v2 comment reads need a scope the app lacks): re-queued
+ * after these delays, ~10.5 min in all (indexing was measured at 2–7 min). Delay `i` follows attempt `i + 1`.
+ */
+export const NOT_INDEXED_DELAYS_SECONDS = [60, 90, 120, 120, 120, 120] as const;
+/** Delay before the next delivery of a not-yet-indexed artifact after `attempt`; null once the window is used up. */
+export function notIndexedDelay(attempt: number): number | null {
+  return NOT_INDEXED_DELAYS_SECONDS[attempt - 1] ?? null;
+}
+/**
+ * One retry chain per artifact: the first delivery (attempt 1) holds this lock until the chain ends, so a second
+ * attempt-1 delivery (the provider notice's backup copy, or a repeated product event) does not start a parallel chain.
+ * Longer than the whole not-indexed window plus processing.
+ */
+export const SENTINEL_CHAIN_SECONDS = 15 * 60;
+export const sentinelChainLock = (b: Pick<SentinelBody, 'source' | 'artifactId' | 'commentId'>): string =>
+  `sentinel-chain:${b.source}.${b.artifactId || '0'}.${b.commentId || '0'}`;
 /** A failed post (other than a rate limit, which the queue retries) is retried at most once per hour… */
 export const FAILED_BACKOFF_MS = 3600_000;
 /** …and at most this many failed posts are recorded per route and artifact (comment). */
