@@ -296,6 +296,11 @@ function DemoData({ onDone }: { onDone: () => void }) {
           {job.error && <span style={{ ...s.error, display: 'block' }}>{job.error}</span>}
         </p>
       )}
+      {job && job.kind !== 'remove' && (job.status === 'done' || job.status === 'partial') && (
+        <p style={{ background: '#e9f2ff', padding: '6px 8px', borderRadius: 4, fontSize: 12 }}>
+          Before recording: Load demo data, open the incident, Analyze once, confirm the 4 signals, Trace reach. Do not Reset or Analyze again while recording.
+        </p>
+      )}
       {[...new Set([...warnings, ...resultWarnings(job)])].map((w) => (
         <p key={w} style={{ background: '#fff7d6', padding: '6px 8px', borderRadius: 4, fontSize: 12 }}>
           {w}

@@ -52,6 +52,9 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), dan p
 
 ### Fixed
 
+- Rute aktif kini ikut menerima alasan, perkiraan hari dihemat, `max_days_before`, `signal_ids`, dan skor terbaru saat trace ulang (sebelumnya alasan basi, mis. "stopped at no team"). Status `active`, aturan yang disetujui (`spec_json`), peringkat, `decided_by`, dan `activated_at` tetap tidak berubah.
+- Insiden demo: hasil "Analyze again" stabil. Consumer `score` memakai ulang vonis LLM yang tersimpan per (insiden, event, hash teks, versi prompt), baik yang menjadi sinyal maupun yang dinilai tidak relevan, dan hanya mengirim kandidat baru ke LLM (tabel baru `score_cache`, migrasi v015; log `score cache { hits, misses }`). Reset to showcase dan Remove demo data mengosongkan cache insiden itu. Insiden non-demo tidak berubah.
+
 - Reach: akun app tidak lagi dihitung sebagai orang. `GET /rest/api/3/myself` sebagai app ditolak (401, scope tidak cocok), jadi akun app dikenali dari `accountType: 'app'` penulis issue/komentar/halaman saat collect (disimpan tanpa penulis, id-nya diingat di settings) dan dari watcher bertipe app. Data lama perlu "Analyze again" agar id app terkumpul.
 - Reach halaman Confluence: penyunting versi halaman (dibaca sebagai pengguna) ikut dihitung sebagai kontributor, sehingga stempel "Reviewed by" langsung terbaca walau Teamwork Graph belum mengindeks kontributor. Stop point kini tim yang menyentuh paling akhir, bukan "no team" dari akun app.
 - "Trace remaining" kini maju: sinyal tanpa jalur yang diketahui ditelusuri lebih dulu, dan jalur `ok` yang tersimpan tidak pernah ditimpa `pending`/`unknown`. Batas waktu juga diperiksa di antara lookup team dalam satu sinyal; tanggal tidak valid tidak lagi melempar error (dihitung "time unknown").
@@ -91,6 +94,7 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), dan p
 
 ### Changed
 
+- Setup: setelah Load/Reset selesai tampil checklist pra-rekam ("Before recording: … Do not Reset or Analyze again while recording.").
 - `onConnectionChange` tidak lagi menulis objek spike `atlassian:document` ke Teamwork Graph; penulisan nyata menyusul dari pipeline.
 - Antrean `score` kini menulis dossier ke Teamwork Graph setelah tiap analisis. Setelah penilaian AI, dossier memuat jumlah sinyal (bukan kandidat) beserta sinyal paling awal; tetap tanpa kutipan atau nama.
 - Panel insiden menampilkan sinyal yang sudah dinilai, bukan lagi daftar kandidat mentah.

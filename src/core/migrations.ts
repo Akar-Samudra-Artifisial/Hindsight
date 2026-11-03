@@ -273,6 +273,25 @@ export const MIGRATIONS: readonly Migration[] = [
       KEY idx_routes_status (status)
     )`,
   },
+  // Demo incident only: the LLM verdict per (incident, event, text hash, prompt version), relevant or not, so
+  // "Analyze again" replays it instead of asking the model again (stable recordings). Cleared by Reset / Remove.
+  {
+    name: 'v015_create_score_cache',
+    statement: `CREATE TABLE IF NOT EXISTS score_cache (
+      incident_key VARCHAR(64) NOT NULL,
+      event_id VARCHAR(36) NOT NULL,
+      text_hash CHAR(64) NOT NULL,
+      prompt_version VARCHAR(32) NOT NULL,
+      relevant TINYINT NOT NULL,
+      signal_type VARCHAR(32) NULL,
+      quote TEXT NULL,
+      reason VARCHAR(255) NULL,
+      confidence DOUBLE NOT NULL DEFAULT 0,
+      model VARCHAR(64) NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (incident_key, event_id, text_hash, prompt_version)
+    )`,
+  },
 ];
 
 /** Name of the newest migration. */

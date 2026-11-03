@@ -275,9 +275,10 @@ describe('demo seed rows', () => {
     expect(rows[0]).toMatchObject({ slot: 'incident', createdByApp: true, scenarioAt: '2026-11-02T09:12:00.000Z', artifactKey: 'INC-1' });
   });
 
-  it('deleteJobsForIncident deletes reach paths, routes, decisions, signals, candidates then jobs, one statement each', async () => {
+  it('deleteJobsForIncident deletes the score cache, reach paths, routes, decisions, signals, candidates then jobs, one statement each', async () => {
     await repo.deleteJobsForIncident('INC-1');
     expect(executeCalls().map((c) => c[0])).toEqual([
+      'DELETE FROM score_cache WHERE incident_key = ?',
       'DELETE FROM reach_paths WHERE incident_key = ?',
       'DELETE FROM routes WHERE origin_incident_key = ?',
       'DELETE FROM signal_decisions WHERE incident_key = ?',
@@ -454,12 +455,38 @@ describe('routes', () => {
     rankNo: i + 1,
   });
 
-  it('upsertRoutes inserts proposed rows and never demotes or rewrites an active route', async () => {
+  /** Applies the ON DUPLICATE KEY UPDATE clause (only the two shapes upsertRoutes uses) to a stored row. */
+  function applyDuplicate(statement: string, stored: Record<string, unknown>, incoming: Record<string, unknown>): Record<string, unknown> {
+    const clause = statement.slice(statement.indexOf('ON DUPLICATE KEY UPDATE') + 'ON DUPLICATE KEY UPDATE'.length);
+    const next = { ...stored };
+    for (const u of clause.split(/,\s(?=\w+ = )/).map((x) => x.trim())) {
+      const plain = /^(\w+) = VALUES\(\1\)$/.exec(u);
+      const guarded = /^(\w+) = IF\(status = 'active', \1, VALUES\(\1\)\)$/.exec(u);
+      if (plain) next[plain[1]!] = incoming[plain[1]!];
+      else if (guarded) next[guarded[1]!] = stored['status'] === 'active' ? stored[guarded[1]!] : incoming[guarded[1]!];
+      else throw new Error(`unexpected update ${u}`);
+    }
+    return next;
+  }
+
+  it('a recompute refreshes the reason of an active route but keeps it active with its rule, rank and decider', async () => {
+    await repo.upsertRoutes([{ ...route(0), reason: 'stopped at Arkana Platform', rankNo: 3 }]);
+    const [statement, ...params] = executeCalls()[0]!;
+    const cols = statement.slice(statement.indexOf('(') + 1, statement.indexOf(')')).split(',').map((c) => c.trim());
+    const incoming = Object.fromEntries(cols.map((c, i) => [c, params[i]]));
+    const stored = { ...incoming, reason: 'stopped at no team', status: 'active', rank_no: 1, spec_json: '{"old":true}', decided_by: 'acc-1', activated_at: '2026-11-03 07:40:00' };
+    const after = applyDuplicate(statement, stored, incoming);
+    expect(after).toMatchObject({ reason: 'stopped at Arkana Platform', status: 'active', rank_no: 1, spec_json: '{"old":true}', decided_by: 'acc-1', activated_at: '2026-11-03 07:40:00', estimated_days_saved: 11 });
+    // A proposed route takes everything new.
+    expect(applyDuplicate(statement, { ...stored, status: 'proposed' }, incoming)).toMatchObject({ rank_no: 3, spec_json: incoming['spec_json'], status: 'proposed' });
+  });
+
+  it('upsertRoutes inserts proposed rows and never demotes an active route', async () => {
     await repo.upsertRoutes([route(0), route(1)]);
     const [statement, ...params] = executeCalls()[0]!;
     expect(statement).toContain('ON DUPLICATE KEY UPDATE');
     const updates = statement.slice(statement.indexOf('ON DUPLICATE KEY UPDATE') + 'ON DUPLICATE KEY UPDATE'.length).split(/,\s(?=\w+ = )/);
-    for (const u of updates) expect(u.trim()).toMatch(/^(\w+) = IF\(status = 'active', \1, VALUES\(\1\)\)$/);
+    for (const u of updates) expect(u.trim()).toMatch(/^(reason|estimated_days_saved|max_days_before|signal_ids|score) = VALUES\(\1\)$|^(spec_json|rank_no) = IF\(status = 'active', \2, VALUES\(\2\)\)$/);
     expect(statement).not.toMatch(/\bstatus = VALUES\(status\)/);
     expect(statement).not.toMatch(/decided_by = VALUES/);
     expect(params).toHaveLength(26);
@@ -492,5 +519,24 @@ describe('deleteProposedRoutes', () => {
     await repo.deleteProposedRoutes('INC-1', ['a', 'b']);
     expect(executeCalls()[0]).toEqual(["DELETE FROM routes WHERE origin_incident_key = ? AND status = 'proposed' AND id IN (?, ?)", 'INC-1', 'a', 'b']);
     expect(await repo.deleteProposedRoutes('INC-1', [])).toBe(0);
+  });
+});
+
+describe('score cache', () => {
+  it('getScoreCache keys verdicts by event and text hash for one incident and prompt version', async () => {
+    sql.query.mockResolvedValueOnce([{ event_id: 'e1', text_hash: 'h1', relevant: 0, signal_type: null, quote: null, reason: null, confidence: 0, model: 'm' }]);
+    const map = await repo.getScoreCache('INC-60', 'score-v2', ['e1', 'e1']);
+    const [statement, ...params] = queryCalls()[0]!;
+    expect(statement).toContain('WHERE incident_key = ? AND prompt_version = ? AND event_id IN (?)');
+    expect(params).toEqual(['INC-60', 'score-v2', 'e1']);
+    expect(map.get('e1|h1')).toEqual({ relevant: false, signalType: null, quote: '', reason: '', confidence: 0, model: 'm' });
+  });
+
+  it('putScoreCache keeps the first verdict for a key (locked)', async () => {
+    await repo.putScoreCache([{ incidentKey: 'INC-60', eventId: 'e1', textHash: 'h1', promptVersion: 'score-v2', relevant: true, signalType: 'external_change', quote: 'q', reason: 'r', confidence: 1.5, model: 'm' }]);
+    const [statement, ...params] = executeCalls()[0]!;
+    expect(statement).toContain('ON DUPLICATE KEY UPDATE incident_key = incident_key');
+    expect(params).toEqual(['INC-60', 'e1', 'h1', 'score-v2', 1, 'external_change', 'q', 'r', 1, 'm']);
+    expect(await repo.putScoreCache([])).toBe(0);
   });
 });
