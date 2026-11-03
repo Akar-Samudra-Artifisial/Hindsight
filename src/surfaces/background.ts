@@ -1,7 +1,7 @@
 /**
  * Triggers, queue consumers and the scheduled trigger. Implemented so far: schema migration, the Teamwork Graph
- * `onConnectionChange` handler (stores the connection), collect, the dossier write after scoring, and the demo job.
- * The rest still only log; scoring, reach, propose and Sentinel come next.
+ * `onConnectionChange` handler (stores the connection), collect, LLM scoring with the dossier write, and the demo job.
+ * The rest still only log; reach, propose and Sentinel come next.
  */
 import { InvocationError, InvocationErrorCode, Queue } from '@forge/events';
 import { confluence, isConfluenceRateLimited } from '../adapters/confluence';
@@ -24,6 +24,9 @@ import {
 import { INCIDENT_SLOT } from '../core/demoData';
 import { analyzeLock } from '../core/jobs';
 import { SchemaSettingUpError } from '../core/schema';
+import { runScoring, type ScoreDeps, type ScoreRunResult } from '../core/score';
+import { chatTool, isLlmRateLimited, LlmUnavailableError, pickModels } from '../llm';
+import { SCORE_TOOL } from '../llm/prompts';
 import { loadDemoData, removeDemoData, resetShowcase, SeedError, type SeedDeps } from '../core/seed';
 
 type ForgeEvent = Record<string, unknown> | undefined;
@@ -280,7 +283,7 @@ const errorMessage = (err: unknown): string => (err instanceof Error ? err.messa
  * consumer, outside `onConnectionChange`). Not the demo incident (and no opt-in) or no active connection → skipped. Never throws: the dossier is a bonus and
  * must not fail the scoring job. The outcome is kept in `settings.dossier_last` for the setup page.
  */
-export async function writeIncidentDossier(job: { id: string; incidentKey: string; windowDays: number }): Promise<DossierStatus> {
+export async function writeIncidentDossier(job: { id: string; incidentKey: string; windowDays: number; status?: JobStatus; candidateCount?: number }): Promise<DossierStatus> {
   const { incidentKey } = job;
   const at = new Date().toISOString();
   let status: DossierStatus;
@@ -296,14 +299,20 @@ export async function writeIncidentDossier(job: { id: string; incidentKey: strin
       console.info('dossier skipped', { incidentKey, reason: 'no connection' });
       status = { incidentKey, at, skipped: 'no connection' };
     } else {
-      const [kept, issue] = await Promise.all([repo.listKeptCandidates(job.id, 200), jira.getIssueSelf(incidentKey)]);
+      const issue = await jira.getIssueSelf(incidentKey);
       if (!issue?.siteUrl) throw new Error(`incident ${incidentKey} not readable by the app`);
+      // After scoring: counts of signals that are not rejected. Before: kept candidates (test dossier).
+      const scored = job.status === 'done';
+      const items = scored
+        ? (await repo.listSignalsForIncident(incidentKey)).filter((s) => s.status !== 'rejected')
+        : await repo.listKeptCandidates(job.id, 200);
       const doc = buildDossier({
         incidentKey,
         siteUrl: issue.siteUrl,
         windowDays: job.windowDays,
-        candidateCount: kept.length,
-        earliestDaysBefore: kept.length > 0 ? Math.max(...kept.map((c) => c.daysBefore)) : null,
+        candidateCount: scored ? (job.candidateCount ?? items.length) : items.length,
+        earliestDaysBefore: items.length > 0 ? Math.max(...items.map((c) => c.daysBefore)) : null,
+        ...(scored ? { signalCount: items.length } : {}),
         now: new Date(),
       });
       if (demo) await trackDossier(doc.id);
@@ -324,25 +333,83 @@ export async function writeIncidentDossier(job: { id: string; incidentKey: strin
   return status;
 }
 
+export const MAX_SCORE_ATTEMPTS = 3;
+/** The score consumer stops starting new batches after this long (its timeout is 900 s). */
+export const SCORE_BUDGET_MS = 10 * 60 * 1000;
+
+const scoreDeps: ScoreDeps = {
+  repo,
+  pickModels: () => pickModels(),
+  callModel: (model, messages) => chatTool(model, messages, SCORE_TOOL),
+  isRateLimited: isLlmRateLimited,
+  now: Date.now,
+};
+
 /**
- * Consumer for the `score` queue. Week 3 scores the kept candidates with Forge LLM; for now it logs and then writes
- * the incident dossier to Teamwork Graph.
+ * Consumer for the `score` queue (`{jobId, attempt}`): under the `job:<id>` lock it scores the kept candidates of a
+ * `scoring` job with Forge LLM in batches of 10. Time left over → re-queue; 429 → re-queue after 60 s with
+ * `attempt + 1` (fails the job after 3); finished → job `done` and the dossier is refreshed. A job that is already
+ * done (setup "Write test dossier") only gets its dossier written.
  */
 export async function scoreCandidates(event: QueueEvent | undefined): Promise<InvocationError | void> {
-  const jobId = typeof event?.body?.['jobId'] === 'string' && UUID.test(event.body['jobId']) ? event.body['jobId'] : null;
-  if (!jobId) {
+  const rawId = event?.body?.['jobId'];
+  if (typeof rawId !== 'string' || !UUID.test(rawId)) {
     console.warn('score: event without a valid job id, ignored');
     return;
   }
+  const { jobId, attempt } = parseJobBody(event?.body);
   if (!(await schemaReady('scoreCandidates'))) return retryLater(SCHEMA_RETRY_SECONDS, 'schema');
-  const job = await repo.getJob(jobId);
-  console.info('score stub', { jobId, candidateCount: job?.candidateCount ?? null });
-  if (!job) return;
-  if (!COLLECTED_JOB_STATUSES.includes(job.status as JobStatus)) {
-    console.info('dossier skipped', { incidentKey: job.incidentKey, reason: `job is ${job.status}` });
-    return;
+  const lock = `job:${jobId}`;
+  if (!(await repo.acquireAppLock(lock, new Date().toISOString(), JOB_LOCK_SECONDS))) return retryLater(SCHEMA_RETRY_SECONDS, 'locked');
+  try {
+    const job = await repo.getJob(jobId);
+    if (!job) {
+      console.info('score skipped', { jobId, reason: 'job not found' });
+      return;
+    }
+    if (job.status !== 'scoring') {
+      if (COLLECTED_JOB_STATUSES.includes(job.status)) await writeIncidentDossier(job);
+      else console.info('dossier skipped', { incidentKey: job.incidentKey, reason: `job is ${job.status}` });
+      return;
+    }
+    let result: ScoreRunResult;
+    try {
+      result = await runScoring(jobId, scoreDeps, { deadline: Date.now() + SCORE_BUDGET_MS });
+    } catch (err) {
+      const error = err instanceof LlmUnavailableError ? err.message : `Scoring failed: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`;
+      await failJob(jobId, undefined, error);
+      console.error('score failed', { jobId, error: error.slice(0, 300) });
+      return;
+    }
+    switch (result.status) {
+      case 'skipped':
+        console.info('score skipped', { jobId, reason: result.reason });
+        return;
+      case 'more':
+        await scoreQueue.push({ body: { jobId, attempt: 1 } });
+        console.info('score more', { jobId, ...result.progress });
+        return;
+      case 'rate_limited':
+        if (attempt >= MAX_SCORE_ATTEMPTS) {
+          await failJob(jobId, undefined, 'LLM rate limited: Forge LLM refused the scoring requests 3 times. Try Analyze again later.');
+          console.warn('score: rate limited, job failed', { jobId, attempt });
+          return;
+        }
+        await scoreQueue.push({ body: { jobId, attempt: attempt + 1 }, delayInSeconds: RATE_LIMIT_DELAY_SECONDS });
+        console.warn('score: rate limited, re-queued', { jobId, attempt });
+        return;
+      case 'done': {
+        // Before `done`: a redelivery after a crash here still finds the job in `scoring` and repeats the cleanup.
+        const stale = await repo.deleteStaleProposedSignals(job.incidentKey, job);
+        await repo.updateJob(jobId, { status: 'done', finishedAt: new Date().toISOString() });
+        console.info('score done', { jobId, signals: result.progress.signals, failed: result.progress.failed, total: result.progress.total, stale });
+        await writeIncidentDossier({ ...job, status: 'done' });
+        return;
+      }
+    }
+  } finally {
+    await repo.releaseAppLock(lock);
   }
-  await writeIncidentDossier(job);
 }
 
 /** The demo consumer stops starting new steps after this long (its timeout is 900 s). */

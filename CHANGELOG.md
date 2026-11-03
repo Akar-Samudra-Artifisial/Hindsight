@@ -30,8 +30,19 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), dan p
 - Panel insiden menampilkan lencana "Simulated history" untuk insiden demo.
 - Skema Forge SQL v009 `demo_artifacts` untuk pencatatan artefak demo.
 - Scope baru `manage:jira-project`, `manage:jira-configuration`, `write:confluence-space`, `write:comment:confluence`, `delete:page:confluence` untuk data demo (major version; perlu `forge install --upgrade`). Penghapusan issue memakai `write:jira-work` yang sudah ada.
+- Penilaian kandidat dengan Forge LLM di antrean `score`: batch 10 kandidat, forced tool call `score_candidates`, temperature 0, prompt `score-v1` (`src/llm/prompts.ts`, salinan `prompts/score.md`) yang menandai isi artefak sebagai data tak tepercaya dan meminta alasan blameless. Model FAST `claude-haiku-4-5-20251001` dipilih lewat `list()` dengan fallback ke model Haiku/Sonnet aktif; model dan versi prompt disimpan di job. Bisa dilanjutkan bila waktu habis; 429 diantrekan ulang setelah 60 detik (maks. 3 kali); tanpa model aktif job gagal dengan pesan "No Forge LLM model available". Job kini berakhir `done` setelah penilaian.
+- Verifikasi kutipan: kutipan LLM harus ada di excerpt kandidat setelah normalisasi (15–300 karakter); bila tidak, kandidat ditandai `score_failed` (`quote_not_found`). Keluaran tidak valid dicoba ulang sekali, lalu `llm_invalid_output`.
+- Skema Forge SQL v010 `signals`, v011 `signal_decisions`, v012 kolom `signal_candidates.score_error`. Sinyal unik per insiden + artefak; analisis ulang tidak mengubah sinyal yang sudah dikonfirmasi atau ditolak.
+- Signal card di panel insiden: jenis sinyal, jarak hari, keyakinan, kutipan verbatim, link ke Jira/Confluence, tombol Confirm/Reject/Undo, progres "Scoring candidates with AI (n/total)", status kosong, dan banner gagal dengan Retry. Keputusan dicatat (accountId hanya untuk audit, tidak dikirim ke UI/Rovo).
+- Action Rovo `find-prior-signals` mengembalikan sinyal yang boleh dilihat pengguna, dan `confirm-signal` mengonfirmasi/menolak sinyal lewat aturan yang sama dengan panel.
+- Kutipan sinyal disimpan sebagai potongan verbatim dari excerpt sumber (rentang yang cocok), bukan teks yang ditulis model. Alasan sinyal dibersihkan dari accountId, email, dan @mention ("someone").
+- Panel membedakan kandidat gagal karena kutipan tidak ditemukan dan karena jawaban AI tidak bisa dipakai.
+- Uji nyata minggu 3 di site dev (3 Nov 2026, v4.5.0): migrasi 12/12; Forge LLM memilih `claude-haiku-4-5-20251001` dan `claude-sonnet-4-6` lewat `list()` (fallback tidak terpakai); Analyze insiden demo INC-60 selesai dalam ~18 detik (48 artefak dipindai → 5 kandidat → 4 sinyal dengan kutipan verbatim lolos verifikasi, 2.302 token); Confirm/Reject/Undo bertahan setelah reload; Remove demo data menghapus dossier dari Rovo Search. Lewat chat agen Rovo Hindsight Investigator, `find-prior-signals` menjawab 4 sinyal yang sama dengan panel (2,43 detik), dan `confirm-signal` meminta konfirmasi lewat form "Please review" sebelum mengonfirmasi sinyal INC-46 (tercatat `via: 'rovo'`, tampil Confirmed di panel).
 
 ### Fixed
+
+- Analisis ulang tidak lagi menghapus sinyal milik analisis lain yang berjalan paralel: pembersihan sinyal `proposed` lama hanya menyentuh job yang dibuat lebih dulu, berjalan sebelum job ditandai `done` (bisa diulang saat redelivery), mempertahankan sinyal lama untuk kandidat yang gagal dinilai, dan ikut menghapus riwayat keputusannya. Analyze juga mengembalikan job yang masih menilai (diperbarui dalam 30 menit terakhir) alih-alih memulai job kedua.
+- "Reset to showcase" dan "Remove demo data" mengosongkan status dossier terakhir di halaman setup.
 
 - "Remove demo data" kini juga menghapus dossier Teamwork Graph insiden demo dari Rovo Search. Setiap dossier demo yang ditulis dicatat di setting `dossier_ids`, lalu dihapus lewat `deleteObjectsByExternalId` dengan connection aktif (tanpa connection: dilewati). Bila penghapusan gagal, hasil job memuat peringatan, Remove tetap selesai, dan id tetap tercatat untuk dicoba lagi. Dossier yatim dari sebelum perbaikan ini (tidak tercatat) hilang dengan memutus lalu menyambung ulang connector.
 - Halaman setup kini selalu menampilkan status project/space demo setelah job selesai: peringatan untuk project/space yang sudah ada sebelumnya, dan catatan untuk project/space yang dibuat Hindsight pada Load sebelumnya dan dipertahankan oleh Remove.
@@ -49,6 +60,10 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), dan p
 
 ### Security
 
+- Prompt penilai `score-v2`: ringkasan dan kata kunci insiden juga dibungkus elemen data tak tepercaya `<incident>`.
+- Deskripsi action `confirm-signal` dan prompt agen: hanya dipanggil atas permintaan eksplisit pengguna untuk sinyal tertentu. Keluaran `find-prior-signals` menandai `quote`, `title`, `reason` sebagai teks tak tepercaya (`untrustedFields`, `untrustedNote`).
+- Signal card hanya merender link `https:`; URL lain tampil sebagai teks.
+
 - Dossier Teamwork Graph (terlihat semua pengguna site) hanya ditulis untuk insiden demo. Penulisan untuk semua insiden adalah opt-in admin lewat setting `dossier_all_incidents` (default mati; UI menyusul minggu 6).
 - Komentar Jira yang dibatasi ke role/grup (`visibility`) dan komentar internal JSM (`jsdPublic: false`) tidak disimpan dan tidak menjadi kandidat, karena izin pembaca hanya dicek per issue.
 - Incident key divalidasi ulang sebelum masuk JQL; project/space key hanya lolos lewat regex whitelist lalu diberi tanda kutip.
@@ -56,7 +71,9 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), dan p
 ### Changed
 
 - `onConnectionChange` tidak lagi menulis objek spike `atlassian:document` ke Teamwork Graph; penulisan nyata menyusul dari pipeline.
-- Antrean `score` (penilaian AI masih stub) kini menulis dossier kandidat ke Teamwork Graph setelah tiap analisis.
+- Antrean `score` kini menulis dossier ke Teamwork Graph setelah tiap analisis. Setelah penilaian AI, dossier memuat jumlah sinyal (bukan kandidat) beserta sinyal paling awal; tetap tanpa kutipan atau nama.
+- Panel insiden menampilkan sinyal yang sudah dinilai, bukan lagi daftar kandidat mentah.
+- "Reset to showcase" dan "Remove demo data" juga menghapus sinyal dan keputusan sinyal insiden demo.
 - Load dan Reset hanya membuat service mapping `checkout` bila belum ada; editan admin tidak lagi ditimpa.
 - Bila project `PAY`/`INC` atau space `PLAT` sudah ada, progres job dan halaman setup menampilkan peringatan bahwa data demo ditambahkan ke sana dan dihapus oleh Remove demo data.
 - Stempel "Reviewed by" pada halaman demo ditunda ke minggu 4; semua artefak demo saat ini ditulis oleh app.

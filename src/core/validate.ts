@@ -17,6 +17,22 @@ export function parseIncidentKey(value: unknown): string {
   return key;
 }
 
+const SIGNAL_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Signal id from the panel or a Rovo action. */
+export function parseSignalId(value: unknown): string {
+  const id = typeof value === 'string' ? value.trim() : '';
+  if (!SIGNAL_ID.test(id)) throw new InputError('signalId must be a signal id returned by Find prior signals.');
+  return id.toLowerCase();
+}
+
+/** `confirm`, `reject` or `undo` (case-insensitive). */
+export function parseDecision(value: unknown): 'confirm' | 'reject' | 'undo' {
+  const d = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (d === 'confirm' || d === 'reject' || d === 'undo') return d;
+  throw new InputError('decision must be confirm, reject or undo.');
+}
+
 export const DEFAULT_WINDOW_DAYS = 30;
 export const MAX_WINDOW_DAYS = 180;
 

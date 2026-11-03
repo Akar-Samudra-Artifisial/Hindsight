@@ -44,8 +44,10 @@ export interface DossierInput {
   siteUrl: string;
   windowDays: number;
   candidateCount: number;
-  /** Days before the incident of the earliest candidate; null when there is none. */
+  /** Days before the incident of the earliest signal (or candidate, before scoring); null when there is none. */
   earliestDaysBefore: number | null;
+  /** Scored signals that are not rejected; undefined before scoring finished. */
+  signalCount?: number;
   now: Date;
 }
 
@@ -53,8 +55,14 @@ export const dossierId = (incidentKey: string): string => `dossier-${incidentKey
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
-export function dossierText(i: Pick<DossierInput, 'incidentKey' | 'windowDays' | 'candidateCount' | 'earliestDaysBefore'>): string {
+export function dossierText(i: Pick<DossierInput, 'incidentKey' | 'windowDays' | 'candidateCount' | 'earliestDaysBefore' | 'signalCount'>): string {
   const window = `in the ${i.windowDays} days before the incident`;
+  if (i.signalCount !== undefined) {
+    const among = `among ${plural(i.candidateCount, 'candidate', 'candidates')}`;
+    if (i.signalCount === 0) return `Hindsight analysed ${i.incidentKey}: no early signals found ${among} ${window}.`;
+    const earliestSignal = i.earliestDaysBefore === null ? '' : `; the earliest ${plural(i.earliestDaysBefore, 'day', 'days')} before`;
+    return `Hindsight analysed ${i.incidentKey}: ${plural(i.signalCount, 'early signal', 'early signals')} found ${among} ${window}${earliestSignal}. Open the Hindsight panel on ${i.incidentKey} to review them.`;
+  }
   if (i.candidateCount === 0) return `Hindsight analysed ${i.incidentKey}: no candidate early signals ${window}.`;
   const earliest = i.earliestDaysBefore === null ? '' : `; the earliest ${plural(i.earliestDaysBefore, 'day', 'days')} before`;
   return `Hindsight analysed ${i.incidentKey}: ${plural(i.candidateCount, 'candidate early signal', 'candidate early signals')} ${window}${earliest}. Open the Hindsight panel on ${i.incidentKey} to review them.`;

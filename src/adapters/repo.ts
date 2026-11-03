@@ -232,6 +232,9 @@ export interface AnalysisJob {
   attempt: number;
   lastError: string | null;
   requestedBy: string | null;
+  modelFast: string | null;
+  modelStrong: string | null;
+  promptVersion: string | null;
   startedAt: string | null;
   finishedAt: string | null;
   createdAt: string;
@@ -239,6 +242,9 @@ export interface AnalysisJob {
 }
 
 export interface JobPatch {
+  modelFast?: string | null;
+  modelStrong?: string | null;
+  promptVersion?: string | null;
   status?: JobStatus;
   cursor?: unknown;
   progress?: unknown;
@@ -281,6 +287,45 @@ export interface Candidate {
   textHash: string | null;
   daysBefore: number;
   status: string;
+}
+
+export type ScoreError = 'quote_not_found' | 'llm_invalid_output';
+
+export const SIGNAL_TYPES = ['technical_warning', 'customer_complaint', 'external_change', 'unanswered_question'] as const;
+export type SignalType = (typeof SIGNAL_TYPES)[number];
+export type SignalStatus = 'proposed' | 'confirmed' | 'rejected';
+export type DecisionKind = 'confirm' | 'reject' | 'undo';
+
+/** A verified signal proposed by scoring; stored with status `proposed`. */
+export interface SignalInput {
+  jobId: string;
+  incidentKey: string;
+  eventId: string;
+  candidateId: string;
+  signalType: SignalType;
+  quote: string;
+  reason: string;
+  confidence: number;
+  daysBefore: number;
+  textHash: string | null;
+  model: string;
+  promptVersion: string;
+}
+
+export interface Signal extends SignalInput {
+  id: string;
+  status: SignalStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SignalDecisionInput {
+  signalId: string;
+  incidentKey: string;
+  decision: DecisionKind;
+  /** accountId of the person who decided; audit only, never returned to the UI or Rovo. */
+  decidedBy: string;
+  reason?: string | null;
 }
 
 export type DemoRole = 'container' | 'incident' | 'signal' | 'context' | 'distractor';
@@ -371,7 +416,12 @@ const EVENT_WRITE_COLS = [
 ] as const;
 const EVENT_READ_COLS = [...EVENT_WRITE_COLS, 'scenario_at'].join(', ');
 const JOB_COLS =
-  'id, incident_key, status, window_days, window_from, window_to, scope_json, cursor_json, progress_json, scanned_count, stored_count, candidate_count, truncated_count, attempt, last_error, requested_by, started_at, finished_at, created_at, updated_at';
+  'id, incident_key, status, window_days, window_from, window_to, scope_json, cursor_json, progress_json, scanned_count, stored_count, candidate_count, truncated_count, attempt, last_error, requested_by, model_fast, model_strong, prompt_version, started_at, finished_at, created_at, updated_at';
+const SIGNAL_COLS =
+  'id, job_id, incident_key, event_id, candidate_id, signal_type, quote, reason, confidence, status, days_before, text_hash, model, prompt_version, created_at, updated_at';
+/** Columns a re-analysis may refresh; only while the signal is still `proposed`. */
+const SIGNAL_REFRESH_COLS = ['job_id', 'candidate_id', 'signal_type', 'quote', 'reason', 'confidence', 'days_before', 'text_hash', 'model', 'prompt_version'] as const;
+export const MAX_SIGNALS = 500;
 const CANDIDATE_COLS =
   'id, job_id, incident_key, event_id, filter_score, reasons, matched_keywords, hint_type, excerpt, text_hash, days_before, status';
 const CANDIDATE_WRITE_COLS = CANDIDATE_COLS.split(', ');
@@ -486,6 +536,9 @@ function toJob(r: Row): AnalysisJob {
     attempt: int(r.attempt),
     lastError: str(r.last_error),
     requestedBy: str(r.requested_by),
+    modelFast: str(r.model_fast),
+    modelStrong: str(r.model_strong),
+    promptVersion: str(r.prompt_version),
     startedAt: fromSqlTs(r.started_at),
     finishedAt: fromSqlTs(r.finished_at),
     createdAt: requiredTs(r.created_at),
@@ -507,6 +560,27 @@ function toCandidate(r: Row): Candidate {
     textHash: str(r.text_hash),
     daysBefore: int(r.days_before),
     status: String(r.status),
+  };
+}
+
+function toSignal(r: Row): Signal {
+  return {
+    id: String(r.id),
+    jobId: String(r.job_id),
+    incidentKey: String(r.incident_key),
+    eventId: String(r.event_id),
+    candidateId: String(r.candidate_id),
+    signalType: String(r.signal_type) as SignalType,
+    quote: String(r.quote ?? ''),
+    reason: String(r.reason ?? ''),
+    confidence: Number(r.confidence ?? 0),
+    status: String(r.status) as SignalStatus,
+    daysBefore: int(r.days_before),
+    textHash: str(r.text_hash),
+    model: String(r.model ?? ''),
+    promptVersion: String(r.prompt_version ?? ''),
+    createdAt: requiredTs(r.created_at),
+    updatedAt: requiredTs(r.updated_at),
   };
 }
 
@@ -555,6 +629,9 @@ function candidateParams(c: CandidateInput): unknown[] {
 
 /** Job patch field → column + SQL value; only these columns can be updated. */
 const JOB_PATCH_COLUMNS: { [K in keyof JobPatch]-?: [column: string, toSql: (v: JobPatch[K]) => unknown] } = {
+  modelFast: ['model_fast', (v) => (v ? v.slice(0, 64) : null)],
+  modelStrong: ['model_strong', (v) => (v ? v.slice(0, 64) : null)],
+  promptVersion: ['prompt_version', (v) => (v ? v.slice(0, 32) : null)],
   status: ['status', (v) => v],
   cursor: ['cursor_json', (v) => jsonOrNull(v)],
   progress: ['progress_json', (v) => JSON.stringify(v ?? {})],
@@ -763,8 +840,13 @@ export const repo = {
     return execute('DELETE FROM incidents WHERE issue_key = ?', issueKey);
   },
 
-  /** Removes every analysis job of the incident and its candidates (two statements). */
+  /**
+   * Removes every analysis job of the incident with its candidates, signals and signal decisions (one statement per
+   * table). Used by Reset / Remove demo data, so confirmed and rejected decisions go too.
+   */
   async deleteJobsForIncident(incidentKey: string): Promise<number> {
+    await execute('DELETE FROM signal_decisions WHERE incident_key = ?', incidentKey);
+    await execute('DELETE FROM signals WHERE incident_key = ?', incidentKey);
     await execute('DELETE FROM signal_candidates WHERE incident_key = ?', incidentKey);
     return execute('DELETE FROM analysis_jobs WHERE incident_key = ?', incidentKey);
   },
@@ -956,6 +1038,115 @@ export const repo = {
   async countCandidates(jobId: string): Promise<number> {
     const rows = await query<Row>('SELECT COUNT(*) AS n FROM signal_candidates WHERE job_id = ?', jobId);
     return rows[0] ? int(rows[0].n) : 0;
+  },
+
+  /** Number of candidates of a job per status (`kept`, `truncated`, `scored`, `score_failed`). */
+  async candidateStatusCounts(jobId: string): Promise<Record<string, number>> {
+    const rows = await query<Row>('SELECT status, COUNT(*) AS n FROM signal_candidates WHERE job_id = ? GROUP BY status', jobId);
+    return Object.fromEntries(rows.map((r) => [String(r.status), int(r.n)]));
+  },
+
+  /** Sets the scoring outcome of candidates of a job (`scored`, or `score_failed` with its reason). */
+  async markCandidates(jobId: string, ids: readonly string[], status: 'scored' | 'score_failed', scoreError: ScoreError | null): Promise<number> {
+    let affected = 0;
+    for (const batch of chunk(ids, 100)) {
+      affected += await execute(
+        `UPDATE signal_candidates SET status = ?, score_error = ? WHERE job_id = ? AND id IN (${placeholders(batch.length)})`,
+        status,
+        scoreError,
+        jobId,
+        ...batch,
+      );
+    }
+    return affected;
+  },
+
+  // Signals
+  /**
+   * Inserts signals on `(incident_key, event_id)`. A duplicate is refreshed only while it is `proposed`: a confirmed
+   * or rejected signal keeps its quote, type and status. Returns affected rows.
+   */
+  async upsertSignals(signals: readonly SignalInput[]): Promise<number> {
+    const updates = SIGNAL_REFRESH_COLS.map((c) => `${c} = IF(status = 'proposed', VALUES(${c}), ${c})`).join(', ');
+    const rowPlaceholder = `(${placeholders(14)})`;
+    let affected = 0;
+    for (const batch of chunk(signals, BATCH_ROWS)) {
+      affected += await execute(
+        `INSERT INTO signals (id, job_id, incident_key, event_id, candidate_id, signal_type, quote, reason, confidence, status, days_before, text_hash, model, prompt_version)
+         VALUES ${batch.map(() => rowPlaceholder).join(', ')} ON DUPLICATE KEY UPDATE ${updates}`,
+        ...batch.flatMap((s) => [
+          randomUUID(),
+          s.jobId,
+          s.incidentKey,
+          s.eventId,
+          s.candidateId,
+          s.signalType,
+          s.quote.slice(0, 300),
+          s.reason.slice(0, 255),
+          Math.min(1, Math.max(0, s.confidence)),
+          'proposed',
+          Math.trunc(s.daysBefore),
+          s.textHash,
+          s.model.slice(0, 64),
+          s.promptVersion.slice(0, 32),
+        ]),
+      );
+    }
+    return affected;
+  },
+
+  /** Signals of an incident (every status), earliest first; capped at `MAX_SIGNALS`. */
+  async listSignalsForIncident(incidentKey: string, limit = MAX_SIGNALS): Promise<Signal[]> {
+    const rows = await query<Row>(
+      `SELECT ${SIGNAL_COLS} FROM signals WHERE incident_key = ? ORDER BY days_before DESC, id ASC LIMIT ${sqlInt(limit, 1, MAX_SIGNALS)}`,
+      incidentKey,
+    );
+    return rows.map(toSignal);
+  },
+
+  async getSignal(id: string): Promise<Signal | undefined> {
+    const rows = await query<Row>(`SELECT ${SIGNAL_COLS} FROM signals WHERE id = ?`, id);
+    return rows[0] ? toSignal(rows[0]) : undefined;
+  },
+
+  /** Compare-and-set status change; returns 1 when the signal was still `from`, else 0. */
+  async updateSignalStatus(id: string, from: SignalStatus, to: SignalStatus): Promise<number> {
+    return execute('UPDATE signals SET status = ? WHERE id = ? AND status = ?', to, id, from);
+  },
+
+  /**
+   * Drops proposed signals that `job` did not propose again, with their decision history. Only signals of jobs created
+   * strictly before `job` qualify (a newer, parallel analysis is never touched), and an event whose candidate failed
+   * scoring in `job` keeps its earlier signal. Decisions first, then signals; returns the deleted signals.
+   */
+  async deleteStaleProposedSignals(incidentKey: string, job: { id: string; createdAt: string }): Promise<number> {
+    const where = `incident_key = ? AND status = 'proposed' AND job_id <> ?
+      AND job_id IN (SELECT id FROM analysis_jobs WHERE incident_key = ? AND created_at < ?)
+      AND event_id NOT IN (SELECT event_id FROM signal_candidates WHERE job_id = ? AND status = 'score_failed')`;
+    const params = [incidentKey, job.id, incidentKey, toSqlTs(job.createdAt), job.id];
+    await execute(`DELETE FROM signal_decisions WHERE incident_key = ? AND signal_id IN (SELECT id FROM signals WHERE ${where})`, incidentKey, ...params);
+    return execute(`DELETE FROM signals WHERE ${where}`, ...params);
+  },
+
+  /** Failed candidates of a job per `score_error` (`quote_not_found`, `llm_invalid_output`). */
+  async scoreErrorCounts(jobId: string): Promise<Record<string, number>> {
+    const rows = await query<Row>(
+      "SELECT score_error, COUNT(*) AS n FROM signal_candidates WHERE job_id = ? AND status = 'score_failed' GROUP BY score_error",
+      jobId,
+    );
+    return Object.fromEntries(rows.map((r) => [String(r.score_error ?? 'unknown'), int(r.n)]));
+  },
+
+  async insertDecision(d: SignalDecisionInput): Promise<void> {
+    await execute(
+      'INSERT INTO signal_decisions (id, signal_id, incident_key, decision, decided_by, reason) VALUES (?, ?, ?, ?, ?, ?)',
+      randomUUID(),
+      d.signalId,
+      d.incidentKey,
+      d.decision,
+      d.decidedBy.slice(0, 128),
+      d.reason ? d.reason.slice(0, 255) : null,
+    );
   },
 
   async markCandidatesTruncated(jobId: string, ids: readonly string[]): Promise<number> {

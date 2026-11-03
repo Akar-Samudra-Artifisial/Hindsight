@@ -4,6 +4,7 @@ const requestTeamworkGraph = vi.fn();
 const setObjects = vi.fn();
 const deleteObjectsByExternalId = vi.fn();
 vi.mock('@forge/api', () => ({ default: { asUser: () => ({ requestTeamworkGraph }), asApp: () => ({}) }, route: () => '' }));
+vi.mock('@forge/llm', () => ({ chat: vi.fn(), list: vi.fn() }));
 vi.mock('@forge/teamwork-graph', () => ({ graph: { setObjects, deleteObjectsByExternalId } }));
 
 const { cloudIdFromInstallContext, deleteObjects, readSpike, runGraphQuery, SPIKE_OBJECT_ID, spikeDocument, summariseWrite, writeDossier, writeObjects } = await import(

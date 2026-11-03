@@ -253,6 +253,7 @@ describe('resetShowcase', () => {
     expect(w.deps.repo.deleteJobsForIncident).toHaveBeenCalledWith('INC-15');
     expect(w.deps.repo.releaseAppLock).toHaveBeenCalledWith('analyze:INC-15');
     expect(w.calls.length).toBe(before);
+    expect(w.deps.repo.setSetting).toHaveBeenCalledWith('dossier_last', null);
   });
 });
 
@@ -267,6 +268,7 @@ describe('removeDemoData', () => {
     expect(w.deps.repo.deleteIncident).toHaveBeenCalledWith('INC-15');
     expect(w.deps.repo.deleteJobsForIncident).toHaveBeenCalledWith('INC-15');
     expect(w.settings.get(T0_SETTING)).toBeNull();
+    expect(w.deps.repo.setSetting).toHaveBeenCalledWith('dossier_last', null);
   });
 
   it('deletes the tracked dossiers and the demo incident dossier, then forgets them', async () => {

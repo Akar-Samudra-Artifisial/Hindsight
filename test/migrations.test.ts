@@ -45,7 +45,7 @@ function columnNames(statement: string): string[] {
 }
 
 describe('MIGRATIONS', () => {
-  it('has the nine tables, v001–v009, unique names in order', () => {
+  it('has v001–v012, unique names in order', () => {
     const names = MIGRATIONS.map((m) => m.name);
     expect(new Set(names).size).toBe(names.length);
     expect(names).toEqual([
@@ -58,8 +58,19 @@ describe('MIGRATIONS', () => {
       'v007_create_analysis_jobs',
       'v008_create_signal_candidates',
       'v009_create_demo_artifacts',
+      'v010_create_signals',
+      'v011_create_signal_decisions',
+      'v012_add_signal_candidates_score_error',
     ]);
-    expect(LATEST_MIGRATION).toBe('v009_create_demo_artifacts');
+    expect(LATEST_MIGRATION).toBe('v012_add_signal_candidates_score_error');
+  });
+
+  it('signals dedup per incident + event and index the status; decisions keep the decider; candidates get score_error', () => {
+    const byName = (n: string) => MIGRATIONS.find((m) => m.name === n)!.statement;
+    expect(byName('v010_create_signals')).toContain('UNIQUE KEY uq_signals_incident_event (incident_key, event_id)');
+    expect(byName('v010_create_signals')).toContain('KEY idx_signals_incident_status (incident_key, status)');
+    expect(byName('v011_create_signal_decisions')).toContain('decided_by VARCHAR(128) NOT NULL');
+    expect(byName('v012_add_signal_candidates_score_error')).toBe('ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS score_error VARCHAR(32) NULL');
   });
 
   it.each(MIGRATIONS.map((m) => [m.name, m.statement]))('%s is a single idempotent statement without foreign keys', (_name, statement) => {
