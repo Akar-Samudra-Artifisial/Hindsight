@@ -724,14 +724,48 @@ describe('Sentinel', () => {
       expect(repoMock.insertAlert).not.toHaveBeenCalled();
     });
 
-    it('a comment the search index does not have yet is re-queued after 60 s, at most 3 attempts', async () => {
+    it('a comment the search index does not have yet is re-queued on 60, 90, 120, 120, 120, 120 s (~10 min), then gives up', async () => {
       confluenceMock.getSentinelContent.mockResolvedValue('not_indexed');
+      const delays: number[] = [];
+      for (let attempt = 1; attempt <= 7; attempt += 1) {
+        queue.push.mockClear();
+        await checkSentinel({ body: { ...commentBody, attempt } });
+        const call = queue.push.mock.calls[0] as unknown[] | undefined;
+        if (call) {
+          expect(call[1]).toEqual({ body: { ...commentBody, attempt: attempt + 1 }, delayInSeconds: expect.any(Number) });
+          delays.push((call[1] as { delayInSeconds: number }).delayInSeconds);
+        }
+      }
+      expect(delays).toEqual([60, 90, 120, 120, 120, 120]);
+      expect(delays.reduce((a, b) => a + b, 0)).toBeGreaterThanOrEqual(600);
+      expect(Math.max(...delays)).toBeLessThanOrEqual(900);
+      expect(console.warn).toHaveBeenCalledWith('sentinel: not indexed yet, gave up', { attempt: 7 });
+      // 429 keeps its own limit of 3 attempts.
+      expect(console.warn).not.toHaveBeenCalledWith('sentinel: rate limited, gave up', expect.anything());
+    });
+
+    it('one retry chain per artifact: a second attempt-1 delivery (backup copy) is skipped while the chain runs', async () => {
+      confluenceMock.getSentinelContent.mockResolvedValue('not_indexed');
+      // First delivery: takes the artifact lock and the chain lock, re-queues, keeps the chain lock.
       await checkSentinel({ body: commentBody });
-      expect(queue.push).toHaveBeenCalledWith('sentinel', { body: { ...commentBody, attempt: 2 }, delayInSeconds: 60 });
-      queue.push.mockClear();
-      await checkSentinel({ body: { ...commentBody, attempt: 3 } });
-      expect(queue.push).not.toHaveBeenCalled();
-      expect(console.warn).toHaveBeenCalledWith('sentinel: not indexed yet, gave up', { attempt: 3 });
+      expect(repoMock.acquireAppLock).toHaveBeenCalledWith('sentinel-chain:confluence.0.901', expect.any(String), 900);
+      expect(repoMock.releaseAppLock).not.toHaveBeenCalledWith('sentinel-chain:confluence.0.901');
+      expect(queue.push).toHaveBeenCalledTimes(1);
+      // Backup copy: the artifact lock is free, the chain lock is held → skipped, no read, no re-queue.
+      repoMock.acquireAppLock.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+      confluenceMock.getSentinelContent.mockClear();
+      await checkSentinel({ body: commentBody });
+      expect(console.info).toHaveBeenCalledWith('sentinel skipped', expect.objectContaining({ reason: 'chain_active' }));
+      expect(confluenceMock.getSentinelContent).not.toHaveBeenCalled();
+      expect(queue.push).toHaveBeenCalledTimes(1);
+      expect(repoMock.releaseAppLock).not.toHaveBeenCalledWith('sentinel-chain:confluence.0.901');
+      // The chain's own re-queued delivery does not need the chain lock; once it posts, the chain lock is freed.
+      confluenceMock.getSentinelContent.mockResolvedValue(content());
+      repoMock.acquireAppLock.mockClear();
+      await checkSentinel({ body: { ...commentBody, attempt: 2 } });
+      expect(repoMock.acquireAppLock).toHaveBeenCalledTimes(1);
+      expect(confluenceMock.createFooterComment).toHaveBeenCalledTimes(1);
+      expect(repoMock.releaseAppLock).toHaveBeenCalledWith('sentinel-chain:confluence.0.901');
     });
 
     it('a comment on a blog post (no page) is skipped; the v2 author of a posted comment is learned as an app account', async () => {

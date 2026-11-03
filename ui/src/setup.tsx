@@ -498,7 +498,7 @@ function SentinelSetup() {
         if (res.error) setNotice({ text: res.error });
         else
           setNotice({
-            text: `Provider notice #${res.n ?? '?'} posted on the demo page. Within a minute Sentinel comments there for the owner team; the alert shows on the Routes tab of ${res.incidentKey ?? 'the incident'}.`,
+            text: `Provider notice #${res.n ?? '?'} posted on the demo page. Sentinel usually comments there for the owner team within a few minutes, once Confluence search has indexed the notice; the alert then shows on the Routes tab of ${res.incidentKey ?? 'the incident'}.`,
             ...(res.pageUrl ? { url: res.pageUrl } : {}),
           });
       })
