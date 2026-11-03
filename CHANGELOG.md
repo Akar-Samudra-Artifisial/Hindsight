@@ -116,6 +116,7 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), dan p
 
 ### Changed
 
+- Syarat "Rovo enabled on the site" ditambahkan ke Testing Instructions `devpost-draft.md` dan `README.md`: Rovo diperlukan untuk agen Rovo, skill, dan connector Teamwork Graph; panel inti (Load demo, Analyze, Confirm, reach map, Routes, Sentinel) dan tool MCP eksternal tetap jalan tanpa Rovo (terbukti di site tanpa Rovo).
 - `docs/PRIVACY.md` diperbarui sesuai fitur yang sudah terbukti: penulisan dossier Teamwork Graph lewat `graph:connector`, tool MCP read-only, agen dan skill Rovo, komentar Sentinel, rincian data Forge SQL (excerpt, kutipan, accountId audit), dan retensi apa adanya (penghapusan otomatis kandidat ditolak belum diimplementasikan). Kata "planned" untuk fitur yang sudah ada dihapus.
 - `README.md` dilengkapi untuk listing: fitur, kebutuhan, instalasi (placeholder link), setup, Load demo data (dengan dan tanpa JSM), connector Teamwork Graph, Enable tools MCP beserta workaround `-32014`, dan penggunaan agen Rovo.
 - Ikon app baru (huruf "H" gradien biru-ungu dengan titik sinyal amber, latar transparan) di `static/icons/hindsight.svg`; ikon connector Teamwork Graph mode gelap memakai `static/icons/hindsight-dark.svg`. Ter-deploy dev 4.16.0 dan production 2.5.0.
