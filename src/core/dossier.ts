@@ -13,6 +13,22 @@ export const DOSSIER_STATUS_KEY = 'dossier_last';
  * dossier is visible to EVERYONE on the site, so this stays an explicit admin choice (setup UI in week 6).
  */
 export const DOSSIER_ALL_INCIDENTS_KEY = 'dossier_all_incidents';
+/** `settings` key holding the ids of the demo dossiers written to Teamwork Graph, so Remove demo data can delete them. */
+export const DOSSIER_IDS_KEY = 'dossier_ids';
+/** Teamwork Graph deletes at most 100 objects per request. */
+export const MAX_TRACKED_DOSSIERS = 100;
+/** Object type of every dossier (`deleteObjectsByExternalId` needs it). */
+export const DOSSIER_OBJECT_TYPE = 'atlassian:document';
+
+/** The tracked id list from `settings` (anything that is not a list of strings counts as empty). */
+export function parseDossierIds(raw: unknown): string[] {
+  return Array.isArray(raw) ? raw.filter((v): v is string => typeof v === 'string' && v !== '') : [];
+}
+
+/** `ids` plus `id`, without duplicates; the oldest are dropped beyond {@link MAX_TRACKED_DOSSIERS}. */
+export function withDossierId(ids: readonly string[], id: string): string[] {
+  return [...ids.filter((v) => v !== id), id].slice(-MAX_TRACKED_DOSSIERS);
+}
 
 export interface DossierStatus {
   incidentKey: string;

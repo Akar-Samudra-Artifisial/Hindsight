@@ -126,6 +126,21 @@ export function writeDossier(connectionId: string, doc: types.DocumentObject): P
   return writeObjects(connectionId, [doc]);
 }
 
+export interface DeleteSummary {
+  success: boolean;
+  error?: string;
+}
+
+/** Deletes objects of one type by their ids (at most 100) for a connection; never throws. Queue consumers only. */
+export async function deleteObjects(connectionId: string, objectType: string, ids: readonly string[]): Promise<DeleteSummary> {
+  try {
+    const res = await graph.deleteObjectsByExternalId({ objectType, externalIds: [...ids], connectionId });
+    return { success: res.success, ...(res.error ? { error: res.error } : {}) };
+  } catch (err) {
+    return { success: false, error: errorText(err) };
+  }
+}
+
 /** Writes `objects` for a connection; never throws. */
 export async function writeObjects(connectionId: string, objects: types.Object[]): Promise<WriteSummary> {
   try {

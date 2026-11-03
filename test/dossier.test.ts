@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildDossier, dossierId, dossierText } from '../src/core/dossier';
+import { buildDossier, dossierId, dossierText, MAX_TRACKED_DOSSIERS, parseDossierIds, withDossierId } from '../src/core/dossier';
 
 const base = {
   incidentKey: 'INC-1',
@@ -37,5 +37,21 @@ describe('buildDossier', () => {
   it('updateSequenceNumber increases with time so a later write replaces the earlier one', () => {
     const later = buildDossier({ ...base, now: new Date('2026-11-03T10:05:00.000Z') });
     expect(later.updateSequenceNumber).toBeGreaterThan(buildDossier(base).updateSequenceNumber);
+  });
+});
+
+describe('tracked dossier ids', () => {
+  it('parses only a list of non-empty strings', () => {
+    expect(parseDossierIds(['a', 2, '', 'b'])).toEqual(['a', 'b']);
+    expect(parseDossierIds('a')).toEqual([]);
+    expect(parseDossierIds(undefined)).toEqual([]);
+  });
+  it('adds without duplicates and keeps at most MAX_TRACKED_DOSSIERS', () => {
+    expect(withDossierId(['a', 'b'], 'a')).toEqual(['b', 'a']);
+    const many = Array.from({ length: MAX_TRACKED_DOSSIERS }, (_, i) => `d${i}`);
+    const next = withDossierId(many, 'new');
+    expect(next).toHaveLength(MAX_TRACKED_DOSSIERS);
+    expect(next.at(-1)).toBe('new');
+    expect(next[0]).toBe('d1');
   });
 });

@@ -33,6 +33,7 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), dan p
 
 ### Fixed
 
+- "Remove demo data" kini juga menghapus dossier Teamwork Graph insiden demo dari Rovo Search. Setiap dossier demo yang ditulis dicatat di setting `dossier_ids`, lalu dihapus lewat `deleteObjectsByExternalId` dengan connection aktif (tanpa connection: dilewati). Bila penghapusan gagal, hasil job memuat peringatan, Remove tetap selesai, dan id tetap tercatat untuk dicoba lagi. Dossier yatim dari sebelum perbaikan ini (tidak tercatat) hilang dengan memutus lalu menyambung ulang connector.
 - Halaman setup kini selalu menampilkan status project/space demo setelah job selesai: peringatan untuk project/space yang sudah ada sebelumnya, dan catatan untuk project/space yang dibuat Hindsight pada Load sebelumnya dan dipertahankan oleh Remove.
 - Penutupan tiket demo S2 dan insiden selalu tercatat: baris log per tiket (berhasil: slot, key, status, resolusi; gagal: slot dan transisi yang tersedia) serta ringkasan `closures` di baris log `demo load` dan di hasil job.
 - Link kandidat Jira di panel insiden dan URL dossier di Rovo Search kini mengarah ke site (`https://<site>.atlassian.net/browse/...`), bukan ke `api.atlassian.com`. Base URL diambil dari `serverInfo.baseUrl`; link Jira yang sudah tersimpan diperbaiki saat Analyze berikutnya.

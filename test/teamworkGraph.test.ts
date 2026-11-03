@@ -2,10 +2,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const requestTeamworkGraph = vi.fn();
 const setObjects = vi.fn();
+const deleteObjectsByExternalId = vi.fn();
 vi.mock('@forge/api', () => ({ default: { asUser: () => ({ requestTeamworkGraph }), asApp: () => ({}) }, route: () => '' }));
-vi.mock('@forge/teamwork-graph', () => ({ graph: { setObjects } }));
+vi.mock('@forge/teamwork-graph', () => ({ graph: { setObjects, deleteObjectsByExternalId } }));
 
-const { cloudIdFromInstallContext, readSpike, runGraphQuery, SPIKE_OBJECT_ID, spikeDocument, summariseWrite, writeDossier, writeObjects } = await import(
+const { cloudIdFromInstallContext, deleteObjects, readSpike, runGraphQuery, SPIKE_OBJECT_ID, spikeDocument, summariseWrite, writeDossier, writeObjects } = await import(
   '../src/adapters/teamworkGraph'
 );
 const { parseConnectionChange } = await import('../src/surfaces/background');
@@ -16,6 +17,7 @@ const reply = (status: number, body: unknown) => ({ ok: status >= 200 && status 
 beforeEach(() => {
   requestTeamworkGraph.mockReset();
   setObjects.mockReset();
+  deleteObjectsByExternalId.mockReset();
 });
 
 describe('runGraphQuery', () => {
@@ -124,5 +126,19 @@ describe('writeDossier', () => {
   it('never throws', async () => {
     setObjects.mockRejectedValue(new Error('preview down'));
     expect(await writeDossier('conn-1', spikeDocument('https://x', new Date()))).toMatchObject({ success: false, error: 'preview down' });
+  });
+});
+
+describe('deleteObjects', () => {
+  it('deletes by external id for the connection', async () => {
+    deleteObjectsByExternalId.mockResolvedValue({ success: true });
+    expect(await deleteObjects('conn-1', 'atlassian:document', ['dossier-inc-1'])).toEqual({ success: true });
+    expect(deleteObjectsByExternalId).toHaveBeenCalledWith({ objectType: 'atlassian:document', externalIds: ['dossier-inc-1'], connectionId: 'conn-1' });
+  });
+  it('reports an unsuccessful reply and never throws', async () => {
+    deleteObjectsByExternalId.mockResolvedValue({ success: false, error: 'HTTP 403' });
+    expect(await deleteObjects('conn-1', 'atlassian:document', ['x'])).toEqual({ success: false, error: 'HTTP 403' });
+    deleteObjectsByExternalId.mockRejectedValue(new Error('preview down'));
+    expect(await deleteObjects('conn-1', 'atlassian:document', ['x'])).toEqual({ success: false, error: 'preview down' });
   });
 });

@@ -250,6 +250,24 @@ describe('scoreCandidates (dossier, gate G3)', () => {
     expect(JSON.stringify((console.info as unknown as { mock: { calls: unknown[] } }).mock.calls)).not.toContain('conn-secret');
   });
 
+  it('tracks the demo dossier id (once) so Remove demo data can delete it', async () => {
+    repoMock.getSetting.mockImplementation(async (k: string) => (k === 'dossier_ids' ? ['dossier-inc-3'] : undefined));
+    await scoreCandidates({ body: { jobId: JOB } });
+    expect(repoMock.setSetting).toHaveBeenCalledWith('dossier_ids', ['dossier-inc-3', 'dossier-inc-7']);
+    repoMock.setSetting.mockClear();
+    repoMock.getSetting.mockImplementation(async (k: string) => (k === 'dossier_ids' ? ['dossier-inc-7'] : undefined));
+    await scoreCandidates({ body: { jobId: JOB } });
+    expect(repoMock.setSetting).not.toHaveBeenCalledWith('dossier_ids', expect.anything());
+  });
+
+  it('does not track an opt-in dossier of a non-demo incident', async () => {
+    repoMock.listDemoArtifacts.mockResolvedValue([]);
+    repoMock.getSetting.mockImplementation(async (k: string) => (k === 'dossier_all_incidents' ? true : undefined));
+    await scoreCandidates({ body: { jobId: JOB } });
+    expect(tw.writeDossier).toHaveBeenCalledTimes(1);
+    expect(repoMock.setSetting).not.toHaveBeenCalledWith('dossier_ids', expect.anything());
+  });
+
   it('skips without a connection', async () => {
     repoMock.getActiveGraphConnection.mockResolvedValue(undefined);
     await scoreCandidates({ body: { jobId: JOB } });

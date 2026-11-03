@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DemoArtifact, DemoArtifactInput, ScenarioEventInput, ServiceMapping } from '../src/adapters/repo';
 import { DEMO, DEMO_ARTIFACTS } from '../src/core/demoData';
+import { DOSSIER_IDS_KEY } from '../src/core/dossier';
 import { containerNotes, existingContainerWarnings, INC_SLOT, loadDemoData, PAY_SLOT, removeDemoData, resetShowcase, SeedError, SPACE_SLOT, T0_SETTING, type SeedDeps } from '../src/core/seed';
 
 const NOW = Date.parse('2026-11-03T10:00:00.000Z');
@@ -118,11 +119,14 @@ function fakeWorld(opts: { existingPageTitle?: string; incRefused?: boolean } = 
     deleteJobsForIncident: vi.fn(async () => 1),
     deleteIncident: vi.fn(async () => 1),
     releaseAppLock: vi.fn(async () => undefined),
+    getActiveGraphConnection: vi.fn(async () => ({ connectionId: 'conn-1' }) as Awaited<ReturnType<SeedDeps['repo']['getActiveGraphConnection']>>),
   };
+  const graph: SeedDeps['graph'] = { deleteDossiers: vi.fn(async () => ({ success: true })) };
   const deps: SeedDeps = {
     jira,
     confluence,
     repo,
+    graph,
     now: () => NOW,
     sleep: vi.fn(async () => undefined),
     deadline: NOW + 60_000,
@@ -263,6 +267,39 @@ describe('removeDemoData', () => {
     expect(w.deps.repo.deleteIncident).toHaveBeenCalledWith('INC-15');
     expect(w.deps.repo.deleteJobsForIncident).toHaveBeenCalledWith('INC-15');
     expect(w.settings.get(T0_SETTING)).toBeNull();
+  });
+
+  it('deletes the tracked dossiers and the demo incident dossier, then forgets them', async () => {
+    const w = fakeWorld();
+    await loadDemoData('acc-1', w.deps);
+    w.settings.set(DOSSIER_IDS_KEY, ['dossier-inc-3', 'dossier-inc-15']);
+    const r = await removeDemoData(w.deps);
+    expect(w.deps.graph.deleteDossiers).toHaveBeenCalledWith('conn-1', ['dossier-inc-3', 'dossier-inc-15']);
+    expect(r).toMatchObject({ complete: true, deletedDossiers: 2, warnings: [] });
+    expect(w.settings.get(DOSSIER_IDS_KEY)).toEqual([]);
+    expect(console.info).toHaveBeenCalledWith('dossier deleted', { ids: ['dossier-inc-3', 'dossier-inc-15'], result: { success: true } });
+  });
+
+  it('skips the dossier delete without an active connection', async () => {
+    const w = fakeWorld();
+    await loadDemoData('acc-1', w.deps);
+    vi.mocked(w.deps.repo.getActiveGraphConnection).mockResolvedValue(undefined);
+    const r = await removeDemoData(w.deps);
+    expect(w.deps.graph.deleteDossiers).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ complete: true, deletedDossiers: 0, warnings: [] });
+    expect(console.info).toHaveBeenCalledWith('dossier delete skipped', { ids: ['dossier-inc-15'], reason: 'no connection' });
+  });
+
+  it('a failed dossier delete is a warning; Remove still completes and the ids stay tracked', async () => {
+    const w = fakeWorld();
+    await loadDemoData('acc-1', w.deps);
+    w.settings.set(DOSSIER_IDS_KEY, ['dossier-inc-15']);
+    vi.mocked(w.deps.graph.deleteDossiers).mockResolvedValue({ success: false, error: 'HTTP 500' });
+    const r = await removeDemoData(w.deps);
+    expect(r).toMatchObject({ complete: true, deletedDossiers: 0 });
+    expect(r.warnings?.[0]).toContain('HTTP 500');
+    expect(w.settings.get(DOSSIER_IDS_KEY)).toEqual(['dossier-inc-15']);
+    expect(w.deps.repo.deleteIncident).toHaveBeenCalledWith('INC-15');
   });
 
   it('a Load after Remove creates a fresh incident in the kept projects', async () => {
