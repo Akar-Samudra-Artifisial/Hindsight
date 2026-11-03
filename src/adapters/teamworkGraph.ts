@@ -121,6 +121,11 @@ export function summariseWrite(res: types.BulkObjectResponse): WriteSummary {
   };
 }
 
+/** Writes one incident dossier for the connection; never throws. Queue consumers only (no resolver writes). */
+export function writeDossier(connectionId: string, doc: types.DocumentObject): Promise<WriteSummary> {
+  return writeObjects(connectionId, [doc]);
+}
+
 /** Writes `objects` for a connection; never throws. */
 export async function writeObjects(connectionId: string, objects: types.Object[]): Promise<WriteSummary> {
   try {

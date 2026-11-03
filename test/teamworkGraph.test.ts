@@ -5,7 +5,7 @@ const setObjects = vi.fn();
 vi.mock('@forge/api', () => ({ default: { asUser: () => ({ requestTeamworkGraph }), asApp: () => ({}) }, route: () => '' }));
 vi.mock('@forge/teamwork-graph', () => ({ graph: { setObjects } }));
 
-const { cloudIdFromInstallContext, readSpike, runGraphQuery, SPIKE_OBJECT_ID, spikeDocument, summariseWrite, writeObjects } = await import(
+const { cloudIdFromInstallContext, readSpike, runGraphQuery, SPIKE_OBJECT_ID, spikeDocument, summariseWrite, writeDossier, writeObjects } = await import(
   '../src/adapters/teamworkGraph'
 );
 const { parseConnectionChange } = await import('../src/surfaces/background');
@@ -110,5 +110,19 @@ describe('parseConnectionChange', () => {
   });
   it.each([undefined, {}, { action: 'CREATED' }, { action: 'OTHER', connectionId: 'c' }, { action: 'CREATED', connectionId: '' }])('rejects %o', (e) => {
     expect(parseConnectionChange(e)).toBeUndefined();
+  });
+});
+
+describe('writeDossier', () => {
+  it('writes the one document for the connection and summarises the result', async () => {
+    setObjects.mockResolvedValue({ success: true, results: { accepted: [{ id: 'dossier-inc-1' }], rejected: [] } });
+    const doc = spikeDocument('https://x.atlassian.net', new Date('2026-11-03T10:00:00Z'));
+    const r = await writeDossier('conn-1', doc);
+    expect(setObjects).toHaveBeenCalledWith({ objects: [doc], connectionId: 'conn-1' });
+    expect(r).toMatchObject({ success: true, accepted: 1, rejected: 0 });
+  });
+  it('never throws', async () => {
+    setObjects.mockRejectedValue(new Error('preview down'));
+    expect(await writeDossier('conn-1', spikeDocument('https://x', new Date()))).toMatchObject({ success: false, error: 'preview down' });
   });
 });

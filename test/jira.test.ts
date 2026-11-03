@@ -9,7 +9,7 @@ vi.mock('@forge/api', async (importOriginal) => {
   };
 });
 
-const { isJiraRateLimited, jira, JiraError, siteBaseFromSelf } = await import('../src/adapters/jira');
+const { isJiraRateLimited, jira, JiraError, pickDoneTransition, siteBaseFromSelf } = await import('../src/adapters/jira');
 
 const reply = (status: number, body: unknown) => ({ ok: status >= 200 && status < 300, status, text: async () => (body === undefined ? '' : JSON.stringify(body)) });
 const pathOf = (call: unknown[]) => (call[0] as { value: string }).value;
@@ -85,5 +85,103 @@ describe('siteBaseFromSelf', () => {
     expect(siteBaseFromSelf('https://one.atlassian.net/rest/api/3/issue/1')).toBe('https://one.atlassian.net');
     expect(siteBaseFromSelf(undefined)).toBeNull();
     expect(siteBaseFromSelf('nope')).toBeNull();
+  });
+});
+
+describe('demo seed and admin calls', () => {
+  it('isAdminAsUser checks mypermissions as the current user', async () => {
+    api.userRequest.mockResolvedValue(reply(200, { permissions: { ADMINISTER: { havePermission: true } } }));
+    expect(await jira.isAdminAsUser()).toBe(true);
+    expect(pathOf(api.userRequest.mock.calls[0] as unknown[])).toBe('/rest/api/3/mypermissions?permissions=ADMINISTER');
+    api.userRequest.mockResolvedValue(reply(200, { permissions: { ADMINISTER: { havePermission: false } } }));
+    expect(await jira.isAdminAsUser()).toBe(false);
+  });
+
+  it('bulkCreateIssues maps rejected elements to undefined, in input order', async () => {
+    api.appRequest.mockResolvedValue(reply(201, { issues: [{ id: 1, key: 'PAY-1' }, { id: 3, key: 'PAY-2' }], errors: [{ failedElementNumber: 1 }] }));
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const doc = { type: 'doc' as const, version: 1 as const, content: [] };
+    const out = await jira.bulkCreateIssues('PAY', '10', [0, 1, 2].map((i) => ({ summary: `s${i}`, description: doc, labels: ['hindsight-demo'] })));
+    expect(out).toEqual([{ id: '1', key: 'PAY-1' }, undefined, { id: '3', key: 'PAY-2' }]);
+    const body = bodyOf(api.appRequest.mock.calls[0] as unknown[]) as { issueUpdates: { fields: Record<string, unknown> }[] };
+    expect(body.issueUpdates[0]!.fields).toMatchObject({ project: { key: 'PAY' }, issuetype: { id: '10' }, labels: ['hindsight-demo'] });
+  });
+
+  it('transitionToDone retries without the resolution when Jira rejects it', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    api.appRequest
+      .mockResolvedValueOnce(reply(200, { transitions: [{ id: '5', to: { name: 'In progress', statusCategory: { key: 'indeterminate' } } }, { id: '9', to: { name: 'Closed', statusCategory: { key: 'done' } } }] }))
+      .mockResolvedValueOnce(reply(400, { errors: { resolution: 'Field cannot be set' } }))
+      .mockResolvedValueOnce(reply(204, undefined));
+    expect(await jira.transitionToDone('INC-2', 'Cannot Reproduce')).toEqual({ closed: true, status: 'Closed', resolution: null, path: [] });
+    const calls = api.appRequest.mock.calls as unknown[][];
+    expect(bodyOf(calls[1]!)).toEqual({ transition: { id: '9' }, fields: { resolution: { name: 'Cannot Reproduce' } } });
+    expect(bodyOf(calls[2]!)).toEqual({ transition: { id: '9' } });
+  });
+
+  it('transitionToDone returns undefined without a Done transition', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    api.appRequest.mockResolvedValue(reply(200, { transitions: [] }));
+    expect(await jira.transitionToDone('INC-2')).toEqual({ closed: false, path: [], available: [] });
+  });
+
+  it('deleteIssue sends DELETE and treats 404 as deleted', async () => {
+    api.appRequest.mockResolvedValue(reply(404, { errorMessages: ['gone'] }));
+    await expect(jira.deleteIssue('PAY-1')).resolves.toBeUndefined();
+    const call = api.appRequest.mock.calls[0] as unknown[];
+    expect(pathOf(call)).toBe('/rest/api/3/issue/PAY-1?deleteSubtasks=true');
+    expect((call[1] as { method: string }).method).toBe('DELETE');
+  });
+
+  it('setIssueProperty PUTs the value; getProject returns the project type', async () => {
+    api.appRequest.mockResolvedValueOnce(reply(200, undefined)).mockResolvedValueOnce(reply(200, { id: 7, key: 'INC', name: 'Arkana Support', projectTypeKey: 'service_desk' }));
+    await jira.setIssueProperty('INC-1', 'hindsight', { serviceKey: 'checkout' });
+    expect((api.appRequest.mock.calls[0] as unknown[])[1]).toMatchObject({ method: 'PUT' });
+    expect(await jira.getProject('INC')).toEqual({ id: '7', key: 'INC', name: 'Arkana Support', projectTypeKey: 'service_desk' });
+  });
+});
+
+describe('site URL and Done transitions', () => {
+  it('siteBaseFromSelf rejects the API gateway host', () => {
+    expect(siteBaseFromSelf('https://api.atlassian.com/ex/jira/abc/rest/api/3/issue/1')).toBeNull();
+  });
+
+  it('siteUrl reads serverInfo.baseUrl; getIssueSelf uses it instead of the gateway self', async () => {
+    api.appRequest.mockImplementation(async (path: { value: string }) =>
+      path.value === '/rest/api/3/serverInfo'
+        ? reply(200, { baseUrl: 'https://one-atlas-vyyd.atlassian.net' })
+        : reply(200, { id: '1', key: 'INC-15', self: 'https://api.atlassian.com/ex/jira/abc/rest/api/3/issue/1' }),
+    );
+    expect(await jira.getIssueSelf('INC-15')).toEqual({ id: '1', key: 'INC-15', siteUrl: 'https://one-atlas-vyyd.atlassian.net' });
+    expect(await jira.siteUrl()).toBe('https://one-atlas-vyyd.atlassian.net');
+  });
+
+  const t = (id: string, name: string, to: string, category = 'done') => ({ id, name, to: { name: to, statusCategory: { key: category } } });
+
+  it('pickDoneTransition prefers Resolve over Cancel when asked, else keeps the first Done', () => {
+    const list = [t('1', 'Cancel', 'Canceled'), t('2', 'Start', 'In progress', 'indeterminate'), t('3', 'Resolve', 'Resolved')];
+    expect(pickDoneTransition(list, true)?.id).toBe('3');
+    expect(pickDoneTransition(list, false)?.id).toBe('1');
+    expect(pickDoneTransition([t('1', 'Decline', 'Declined'), t('4', 'Mark', 'Closed')], true)?.id).toBe('4');
+    expect(pickDoneTransition([t('1', 'Cancel', 'Canceled')], true)?.id).toBe('1');
+  });
+
+  it('transitionToDone hops through an intermediate status to reach Done', async () => {
+    api.appRequest
+      .mockResolvedValueOnce(reply(200, { transitions: [t('11', 'Start work', 'In progress', 'indeterminate')] }))
+      .mockResolvedValueOnce(reply(204, undefined))
+      .mockResolvedValueOnce(reply(200, { transitions: [t('21', 'Cancel', 'Canceled'), t('22', 'Resolve', 'Resolved')] }))
+      .mockResolvedValueOnce(reply(204, undefined));
+    expect(await jira.transitionToDone('INC-15', undefined, { preferResolved: true })).toEqual({ closed: true, status: 'Resolved', resolution: null, path: ['In progress'] });
+    expect(bodyOf((api.appRequest.mock.calls as unknown[][])[3]!)).toEqual({ transition: { id: '22' } });
+  });
+});
+
+describe('transitionToDone without a reachable Done status', () => {
+  it('returns the offered transitions so the caller can log them', async () => {
+    const t = { id: '1', name: 'Respond', to: { name: 'Waiting for customer', statusCategory: { key: 'indeterminate' } } };
+    api.appRequest.mockImplementation(async (_p: unknown, init?: { method?: string }) => (init?.method === 'POST' ? reply(204, undefined) : reply(200, { transitions: [t] })));
+    const r = await jira.transitionToDone('INC-3', 'Cannot Reproduce');
+    expect(r).toEqual({ closed: false, path: ['Waiting for customer'], available: ['Respond → Waiting for customer'] });
   });
 });

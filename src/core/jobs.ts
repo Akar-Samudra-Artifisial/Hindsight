@@ -2,7 +2,7 @@ import type { RawIssue } from '../adapters/jira';
 import type { AnalysisJob, Incident, IncidentInput, JobInput, JobPatch, JobStatus, ServiceMapping } from '../adapters/repo';
 import { buildScope, type Scope } from './scope';
 import { adfToText, normaliseText } from './text';
-import { InputError } from './validate';
+import { InputError, SERVICE_KEY } from './validate';
 
 /** Analysis job state machine and the start of a job (shared by the incident panel and, later, the Rovo action). */
 
@@ -53,7 +53,7 @@ const stringList = (raw: unknown): string[] => (Array.isArray(raw) ? raw.filter(
 export function propertyServiceKey(value: unknown): string | null {
   if (!value || typeof value !== 'object') return null;
   const key = (value as { serviceKey?: unknown }).serviceKey;
-  return typeof key === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(key) ? key : null;
+  return typeof key === 'string' && SERVICE_KEY.test(key) ? key : null;
 }
 
 /**

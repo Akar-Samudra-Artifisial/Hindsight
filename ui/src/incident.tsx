@@ -37,6 +37,8 @@ interface JobView {
 interface AnalysisReply {
   ready: true;
   incidentKey: string;
+  simulated: boolean;
+  scenarioStartedAt: string | null;
   job: JobView | null;
   funnel: Funnel | null;
   candidates: CandidateView[];
@@ -62,6 +64,7 @@ const s = {
   muted: { color: '#626f86', fontSize: 12 },
   warn: { background: '#fff7d6', padding: '6px 8px', borderRadius: 4, fontSize: 12, margin: '8px 0' },
   item: { borderTop: '1px solid #dcdfe4', padding: '8px 0' },
+  badge: { display: 'inline-block', background: '#e9f2ff', color: '#0055cc', borderRadius: 3, padding: '1px 6px', fontSize: 11, fontWeight: 600, marginLeft: 8 },
 } as const;
 
 function App() {
@@ -111,6 +114,14 @@ function App() {
       <button type="button" onClick={analyze} disabled={busy || running}>
         {running ? 'Analyzing…' : job ? 'Analyze again' : 'Analyze'}
       </button>
+      {analysis?.simulated && (
+        <span
+          style={s.badge}
+          title={`Demo data: dates are simulated relative to an incident start of ${analysis.scenarioStartedAt ? new Date(analysis.scenarioStartedAt).toLocaleString() : 'the scenario'}.`}
+        >
+          Simulated history
+        </span>
+      )}
       {error && <p style={{ color: '#ae2e24' }}>{error}</p>}
       {reply && 'error' in reply && <p style={{ color: '#ae2e24' }}>{reply.error}</p>}
       {!reply && !error && <p style={s.muted}>Loading…</p>}

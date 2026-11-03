@@ -301,7 +301,7 @@ resources:
 permissions:
   scopes:
     - read:jira-work
-    - write:jira-work
+    - write:jira-work # also DELETE /rest/api/3/issue (Remove demo data)
     - read:servicedesk-request
     - read:confluence-content.all
     - read:confluence-content.summary # page/comment events
@@ -310,6 +310,12 @@ permissions:
     - read:space:confluence # v2 API
     - write:confluence-content # PIR section and Sentinel comments
     - write:page:confluence # v2 API
+    # Demo seed (Load / Remove demo data on the setup page, admin only)
+    - manage:jira-project # create the demo projects PAY and INC
+    - manage:jira-configuration # classic scope recommended for POST /rest/api/3/project
+    - write:confluence-space # create the demo space PLAT (v1 POST /wiki/rest/api/space)
+    - write:comment:confluence # v2 footer comments (demo signal, later Sentinel)
+    - delete:page:confluence # Remove demo data: delete and purge pages the app created
     # Teamwork Graph read (Preview; a missing scope returns empty data, not an error)
     - read:graph:issue:jira
     - read:graph:project:jira

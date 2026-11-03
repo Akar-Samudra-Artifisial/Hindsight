@@ -73,6 +73,20 @@ async function search(as: 'app' | 'user', params: URLSearchParams): Promise<Sear
   return { results, base: body._links?.base ?? null, ...(nextCursor ? { nextCursor } : {}) };
 }
 
+async function readJson<T>(res: APIResponse, what: string): Promise<T> {
+  if (!res.ok) throw await failure(res, what);
+  const text = await res.text();
+  return (text ? JSON.parse(text) : undefined) as T;
+}
+
+const JSON_HEADERS = { Accept: 'application/json', 'Content-Type': 'application/json' };
+
+interface RawPage {
+  id: string | number;
+  title?: string;
+  _links?: { webui?: string; base?: string };
+}
+
 export const confluence = {
   /** One page (50) of a CQL search as the app, with storage body, version, history, space and container. */
   searchContent(cql: string, cursor: string | undefined): Promise<SearchPage> {
@@ -103,6 +117,105 @@ export const confluence = {
       }
     }
     return visible;
+  },
+
+  // --- Demo seed --------------------------------------------------------------------------------
+
+  /** The space with this key, or undefined. */
+  async findSpace(key: string): Promise<{ id: string; key: string } | undefined> {
+    const res = await api.asApp().requestConfluence(route`/wiki/api/v2/spaces?keys=${key}&limit=1`, { headers: { Accept: 'application/json' } });
+    const body = await readJson<{ results?: { id: string | number; key: string }[] }>(res, `find space ${key}`);
+    const space = body.results?.[0];
+    return space ? { id: String(space.id), key: space.key } : undefined;
+  },
+
+  /** Creates a global space (v1 API, scope `write:confluence-space`). */
+  async createSpace(key: string, name: string, description: string): Promise<{ id: string; key: string }> {
+    const res = await api.asApp().requestConfluence(route`/wiki/rest/api/space`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ key, name, description: { plain: { value: description, representation: 'plain' } } }),
+    });
+    const body = await readJson<{ id: string | number; key: string }>(res, `create space ${key}`);
+    return { id: String(body.id), key: body.key };
+  },
+
+  /** The current page with exactly this title in the space, or undefined. */
+  async findPageByTitle(spaceId: string, title: string): Promise<{ id: string; webUrl: string | null } | undefined> {
+    const res = await api
+      .asApp()
+      .requestConfluence(route`/wiki/api/v2/spaces/${spaceId}/pages?title=${title}&status=current&limit=1`, { headers: { Accept: 'application/json' } });
+    const body = await readJson<{ results?: RawPage[]; _links?: { base?: string } }>(res, `find page in space ${spaceId}`);
+    const page = body.results?.[0];
+    if (!page) return undefined;
+    const base = body._links?.base;
+    return { id: String(page.id), webUrl: base && page._links?.webui ? `${base}${page._links.webui}` : null };
+  },
+
+  /** Creates a current page from storage-format XHTML (v2). */
+  async createPage(spaceId: string, title: string, storage: string): Promise<{ id: string; webUrl: string | null }> {
+    const res = await api.asApp().requestConfluence(route`/wiki/api/v2/pages`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ spaceId, status: 'current', title, body: { representation: 'storage', value: storage } }),
+    });
+    const page = await readJson<RawPage>(res, `create page "${title}"`);
+    const links = page._links;
+    return { id: String(page.id), webUrl: links?.base && links.webui ? `${links.base}${links.webui}` : null };
+  },
+
+  /** Adds a global label (v1 API: v2 has no label write endpoint). */
+  async addPageLabel(pageId: string, label: string): Promise<void> {
+    const res = await api.asApp().requestConfluence(route`/wiki/rest/api/content/${pageId}/label`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify([{ prefix: 'global', name: label }]),
+    });
+    await readJson<unknown>(res, `add label to page ${pageId}`);
+  },
+
+  /**
+   * Adds a footer comment to a page. Tries v2 `footer-comments` first [VERIFY scope `write:comment:confluence`]; when
+   * v2 refuses it (401/403/404) it falls back to v1 `POST /wiki/rest/api/content` type `comment`.
+   */
+  async createFooterComment(pageId: string, storage: string): Promise<{ id: string; via: 'v2' | 'v1' }> {
+    const res = await api.asApp().requestConfluence(route`/wiki/api/v2/footer-comments`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ pageId, body: { representation: 'storage', value: storage } }),
+    });
+    if (res.ok) {
+      const body = await readJson<{ id: string | number }>(res, `comment on page ${pageId}`);
+      return { id: String(body.id), via: 'v2' };
+    }
+    if (res.status !== 401 && res.status !== 403 && res.status !== 404) throw await failure(res, `comment on page ${pageId}`);
+    console.warn('confluence footer comment: v2 refused, falling back to v1', { pageId, status: res.status });
+    const v1 = await api.asApp().requestConfluence(route`/wiki/rest/api/content`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ type: 'comment', container: { id: pageId, type: 'page' }, body: { storage: { value: storage, representation: 'storage' } } }),
+    });
+    const body = await readJson<{ id: string | number }>(v1, `comment on page ${pageId} (v1)`);
+    return { id: String(body.id), via: 'v1' };
+  },
+
+  /** Moves the page to the trash, then purges it. A missing page counts as deleted; a failed purge is only logged. */
+  async deletePage(pageId: string): Promise<void> {
+    const res = await api.asApp().requestConfluence(route`/wiki/api/v2/pages/${pageId}`, { method: 'DELETE', headers: { Accept: 'application/json' } });
+    if (!res.ok && res.status !== 404) throw await failure(res, `delete page ${pageId}`);
+    const purge = await api
+      .asApp()
+      .requestConfluence(route`/wiki/api/v2/pages/${pageId}?purge=true`, { method: 'DELETE', headers: { Accept: 'application/json' } });
+    if (!purge.ok && purge.status !== 404) console.warn('confluence purge failed, page left in trash', { pageId, status: purge.status });
+  },
+
+  /** Total number of results for `cql` as the app (search index; lags right after creation). */
+  async countByCql(cql: string): Promise<number> {
+    const res = await api.asApp().requestConfluence(route`/wiki/rest/api/search?${new URLSearchParams({ cql, limit: '1' })}`, {
+      headers: { Accept: 'application/json' },
+    });
+    const body = await readJson<{ totalSize?: number; size?: number }>(res, 'count search');
+    return body.totalSize ?? body.size ?? 0;
   },
 };
 

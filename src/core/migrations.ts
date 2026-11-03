@@ -164,6 +164,24 @@ export const MIGRATIONS: readonly Migration[] = [
       KEY idx_candidates_job_rank (job_id, filter_score, days_before)
     )`,
   },
+  // Demo seed bookkeeping: one row per artifact slot (idempotent Load, Remove only deletes created_by_app=1).
+  // role: container|incident|signal|context|distractor; comment rows carry the parent id in artifact_id.
+  {
+    name: 'v009_create_demo_artifacts',
+    statement: `CREATE TABLE IF NOT EXISTS demo_artifacts (
+      slot VARCHAR(64) PRIMARY KEY,
+      role VARCHAR(16) NOT NULL,
+      source VARCHAR(16) NOT NULL,
+      artifact_id VARCHAR(64) NOT NULL,
+      comment_id VARCHAR(64) NOT NULL DEFAULT '',
+      artifact_key VARCHAR(64) NULL,
+      url VARCHAR(1024) NULL,
+      scenario_at TIMESTAMP NULL,
+      created_by_app TINYINT NOT NULL DEFAULT 1,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      KEY idx_demo_artifacts_ref (source, artifact_id)
+    )`,
+  },
 ];
 
 /** Name of the newest migration. */

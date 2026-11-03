@@ -1,16 +1,21 @@
 /**
- * Triggers, queue consumers and the scheduled trigger. Implemented so far: schema migration (lifecycle trigger +
- * `schema-migrate` consumer) and the Teamwork Graph `onConnectionChange` handler, which stores the connection.
- * The rest still only log; the pipeline (collect → score → reach → propose, Sentinel) comes next.
+ * Triggers, queue consumers and the scheduled trigger. Implemented so far: schema migration, the Teamwork Graph
+ * `onConnectionChange` handler (stores the connection), collect, the dossier write after scoring, and the demo job.
+ * The rest still only log; scoring, reach, propose and Sentinel come next.
  */
 import { InvocationError, InvocationErrorCode, Queue } from '@forge/events';
 import { confluence, isConfluenceRateLimited } from '../adapters/confluence';
 import { isJiraRateLimited, jira } from '../adapters/jira';
-import { repo, type ConnectionAction } from '../adapters/repo';
+import { COLLECTED_JOB_STATUSES, repo, type ConnectionAction, type JobStatus } from '../adapters/repo';
 import { ensureSchema, requestMigration, runMigrations } from '../adapters/sql';
+import { writeDossier } from '../adapters/teamworkGraph';
 import { COLLECT_BUDGET_MS, COLLECT_PAGES_PER_RUN, runCollectStep, type CollectDeps } from '../core/collect';
+import { DEMO_QUEUE, runDemoJob, type DemoJob, type DemoProgress, type DemoRunResult } from '../core/demoJob';
+import { buildDossier, DOSSIER_ALL_INCIDENTS_KEY, DOSSIER_STATUS_KEY, type DossierStatus } from '../core/dossier';
+import { INCIDENT_SLOT } from '../core/demoData';
 import { analyzeLock } from '../core/jobs';
 import { SchemaSettingUpError } from '../core/schema';
+import { loadDemoData, removeDemoData, resetShowcase, SeedError, type SeedDeps } from '../core/seed';
 
 type ForgeEvent = Record<string, unknown> | undefined;
 
@@ -157,7 +162,7 @@ const scoreQueue = new Queue({ key: SCORE_QUEUE });
 
 const collectDeps: CollectDeps = {
   repo,
-  jira: { searchPage: (jql, token) => jira.searchPage(jql, token), listComments: (id, startAt, max) => jira.listComments(id, startAt, max) },
+  jira: { searchPage: (jql, token) => jira.searchPage(jql, token), listComments: (id, startAt, max) => jira.listComments(id, startAt, max), siteUrl: () => jira.siteUrl() },
   confluence: { searchContent: (cql, cursor) => confluence.searchContent(cql, cursor) },
   isRateLimited: (err) => isJiraRateLimited(err) || isConfluenceRateLimited(err),
   now: Date.now,
@@ -242,16 +247,160 @@ export async function collectEvents(event: QueueEvent | undefined): Promise<Invo
   }
 }
 
-/** Consumer for the `score` queue. Week 3 scores the kept candidates with Forge LLM; for now it only logs. */
-export async function scoreCandidates(event: QueueEvent | undefined): Promise<void> {
-  const jobId = typeof event?.body?.['jobId'] === 'string' ? event.body['jobId'] : null;
-  const job = jobId ? await repo.getJob(jobId) : undefined;
+/**
+ * The dossier is visible to everyone on the site, so it is only written for the demo incident, unless the admin
+ * opted in with `settings.dossier_all_incidents = true`.
+ */
+async function dossierAllowed(incidentKey: string): Promise<boolean> {
+  if ((await repo.getSetting<unknown>(DOSSIER_ALL_INCIDENTS_KEY)) === true) return true;
+  const artifacts = await repo.listDemoArtifacts();
+  return artifacts.some((a) => a.slot === INCIDENT_SLOT && a.artifactKey === incidentKey);
+}
+
+const errorMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err)).slice(0, 300);
+
+/**
+ * Writes the incident's dossier to Teamwork Graph through the stored connector connection (gate G3: a write from a
+ * consumer, outside `onConnectionChange`). Not the demo incident (and no opt-in) or no active connection → skipped. Never throws: the dossier is a bonus and
+ * must not fail the scoring job. The outcome is kept in `settings.dossier_last` for the setup page.
+ */
+export async function writeIncidentDossier(job: { id: string; incidentKey: string; windowDays: number }): Promise<DossierStatus> {
+  const { incidentKey } = job;
+  const at = new Date().toISOString();
+  let status: DossierStatus;
+  try {
+    if (!(await dossierAllowed(incidentKey))) {
+      // Not recorded in dossier_last: the setup page reports the demo dossier, not every analysed incident.
+      console.info('dossier skipped', { incidentKey, reason: 'not demo incident' });
+      return { incidentKey, at, skipped: 'not demo incident' };
+    }
+    const connection = await repo.getActiveGraphConnection();
+    if (!connection) {
+      console.info('dossier skipped', { incidentKey, reason: 'no connection' });
+      status = { incidentKey, at, skipped: 'no connection' };
+    } else {
+      const [kept, issue] = await Promise.all([repo.listKeptCandidates(job.id, 200), jira.getIssueSelf(incidentKey)]);
+      if (!issue?.siteUrl) throw new Error(`incident ${incidentKey} not readable by the app`);
+      const doc = buildDossier({
+        incidentKey,
+        siteUrl: issue.siteUrl,
+        windowDays: job.windowDays,
+        candidateCount: kept.length,
+        earliestDaysBefore: kept.length > 0 ? Math.max(...kept.map((c) => c.daysBefore)) : null,
+        now: new Date(),
+      });
+      const result = await writeDossier(connection.connectionId, doc);
+      if (result.error || !result.success) {
+        console.warn('dossier failed', { incidentKey, accepted: result.accepted, rejected: result.rejected, error: result.error ?? 'not successful' });
+        status = { incidentKey, at, accepted: result.accepted, rejected: result.rejected, error: result.error ?? 'Teamwork Graph did not accept the write.' };
+      } else {
+        console.info('dossier written', { incidentKey, accepted: result.accepted, rejected: result.rejected, connectionId: '<redacted>' });
+        status = { incidentKey, at, accepted: result.accepted, rejected: result.rejected };
+      }
+    }
+  } catch (err) {
+    console.warn('dossier failed', { incidentKey, error: errorMessage(err) });
+    status = { incidentKey, at, error: errorMessage(err) };
+  }
+  await repo.setSetting(DOSSIER_STATUS_KEY, status).catch((err: unknown) => console.warn('dossier status not saved', { error: errorMessage(err) }));
+  return status;
+}
+
+/**
+ * Consumer for the `score` queue. Week 3 scores the kept candidates with Forge LLM; for now it logs and then writes
+ * the incident dossier to Teamwork Graph.
+ */
+export async function scoreCandidates(event: QueueEvent | undefined): Promise<InvocationError | void> {
+  const jobId = typeof event?.body?.['jobId'] === 'string' && UUID.test(event.body['jobId']) ? event.body['jobId'] : null;
+  if (!jobId) {
+    console.warn('score: event without a valid job id, ignored');
+    return;
+  }
+  if (!(await schemaReady('scoreCandidates'))) return retryLater(SCHEMA_RETRY_SECONDS, 'schema');
+  const job = await repo.getJob(jobId);
   console.info('score stub', { jobId, candidateCount: job?.candidateCount ?? null });
+  if (!job) return;
+  if (!COLLECTED_JOB_STATUSES.includes(job.status as JobStatus)) {
+    console.info('dossier skipped', { incidentKey: job.incidentKey, reason: `job is ${job.status}` });
+    return;
+  }
+  await writeIncidentDossier(job);
+}
+
+/** The demo consumer stops starting new steps after this long (its timeout is 900 s). */
+export const DEMO_BUDGET_MS = 12 * 60 * 1000;
+/** How long the demo consumer waits for Jira/Confluence search to see the demo data. */
+export const DEMO_INDEX_WAIT_MS = 3 * 60 * 1000;
+const demoQueue = new Queue({ key: DEMO_QUEUE });
+
+/** Queues a demo job event for the `demo-seed` consumer. */
+export async function enqueueDemoJob(jobId: string, attempt = 1, delayInSeconds?: number): Promise<void> {
+  await demoQueue.push({ body: { jobId, attempt }, ...(delayInSeconds ? { delayInSeconds } : {}) });
+}
+
+function seedDeps(progress: DemoProgress): SeedDeps {
+  return {
+    jira,
+    confluence,
+    repo,
+    now: Date.now,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    deadline: Date.now() + DEMO_BUDGET_MS,
+    indexWaitMs: DEMO_INDEX_WAIT_MS,
+    progress,
+  };
+}
+
+/** Runs one demo job's work and logs its outcome. */
+export async function runDemoWork(job: DemoJob, progress: DemoProgress): Promise<DemoRunResult> {
+  const deps = seedDeps(progress);
+  switch (job.kind) {
+    case 'load': {
+      const result = await loadDemoData(job.accountId, deps);
+      console.info('demo load', {
+        created: result.created,
+        existing: result.existing,
+        events: result.events,
+        indexed: result.indexed,
+        complete: result.complete,
+        incidentKey: result.incidentKey,
+        warnings: result.warnings,
+        closures: result.closures.map((c) => `${c.slot} ${c.key ?? '-'}: ${c.outcome}${c.status ? ` (${c.status}${c.resolution ? `, ${c.resolution}` : ''})` : ''}`),
+      });
+      return result;
+    }
+    case 'reset': {
+      const result = await resetShowcase(deps);
+      console.info('demo reset', result);
+      return result;
+    }
+    case 'remove': {
+      const result = await removeDemoData(deps);
+      console.info('demo remove', result);
+      return result;
+    }
+  }
+}
+
+/** Consumer for the `demo-seed` queue: runs one Load / Reset / Remove job, re-queuing itself after a 429. */
+export async function demoJob(event: QueueEvent | undefined): Promise<InvocationError | void> {
+  const jobId = event?.body?.['jobId'];
+  if (typeof jobId !== 'string' || !UUID.test(jobId)) throw new Error('demo event body.jobId must be a job id');
+  const raw = event?.body?.['attempt'];
+  const attempt = typeof raw === 'number' && Number.isInteger(raw) && raw > 0 ? raw : 1;
+  if (!(await schemaReady('demoJob'))) return retryLater(SCHEMA_RETRY_SECONDS, 'schema');
+  await runDemoJob(jobId, attempt, {
+    repo,
+    now: Date.now,
+    run: runDemoWork,
+    userMessage: (err) => (err instanceof SeedError ? err.message : undefined),
+    isRateLimited: (err) => isJiraRateLimited(err) || isConfluenceRateLimited(err),
+    requeue: (id, next, delay) => enqueueDemoJob(id, next, delay),
+  });
 }
 
 export const onWorkEvent = stub('onWorkEvent');
 export const traceReach = stub('traceReach');
 export const proposeRoutesJob = stub('proposeRoutesJob');
 export const checkSentinel = stub('checkSentinel');
-export const demoJob = stub('demoJob');
 export const purgeExpired = stub('purgeExpired');

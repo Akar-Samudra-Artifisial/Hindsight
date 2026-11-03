@@ -18,7 +18,7 @@ const POINTS = {
   jsmDismissed: 10,
 } as const;
 
-const RISK_TERMS =
+export const RISK_TERMS =
   /\b(deprecat\w*|end[ -]of[ -]life|eol|will break|time ?outs?|timed out|retr(?:y|ies|ied|ying)|risk\w*|tls|certificates?|certs?)\b/i;
 const EXTERNAL_CHANGE = /\b(deprecat\w*|vendor\w*|end[ -]of[ -]life|eol|sunset\w*)\b/i;
 const JSM_DISMISSED = /(cannot|can't|can not|could not|couldn't) reproduce|won'?t (do|fix)/i;

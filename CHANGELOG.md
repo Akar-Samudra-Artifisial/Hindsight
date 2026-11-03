@@ -23,9 +23,24 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), dan p
 - Panel insiden: tombol "Analyze" dengan status job, funnel (scanned → stored → candidates), dan daftar kandidat. Kandidat hanya ditampilkan bila pengguna berhak melihat artefaknya; sisanya hanya dihitung.
 - Scope `search:confluence` untuk pencarian CQL Confluence (perlu `forge install --upgrade`).
 - Uji nyata di site dev (3 Nov 2026, v3.1.0): migrasi 8/8 selesai (dipicu saat halaman dibuka karena deploy minor tidak memicu event upgrade), `connectionId` tersimpan saat connector diputus dan disambung ulang, dan Analyze berjalan end-to-end pada insiden JSM (12 artefak dipindai, 0 kandidat; penilaian AI masih stub).
+- Data demo Arkana Commerce: tombol "Load demo data" di halaman setup membuat project Jira `PAY`, project JSM `INC`, space Confluence `PLAT` (atau memakai yang sudah ada), sekitar 50 work item, tiket, halaman, dan komentar (tiga sinyal awal di antara 40 pengalih), lalu insiden "Checkout payments failing" paling akhir. Tiap artefak diberi waktu skenario relatif terhadap awal insiden, berjalan di antrean `demo-seed` dengan progres 10 langkah, bisa dilanjutkan bila waktu habis atau kena limit 429, dan tidak menggandakan artefak bila diklik ulang.
+- "Reset to showcase" menghapus analisis insiden demo dan menulis ulang waktu skenario tanpa membuat ulang artefak; "Remove demo data" menghapus hanya issue dan halaman yang dibuat app (project, space, dan service mapping tetap).
+- Form service mapping di halaman setup (tambah, ubah, hapus; maksimal 50 mapping, 20 nilai per daftar) dengan validasi input. Semua aksi setup hanya untuk administrator Jira yang membuka halaman setup.
+- Dossier Teamwork Graph: setelah analisis, antrean `score` menulis dokumen "Early signals for <insiden>" lewat connection connector yang tersimpan. Isinya hanya jumlah kandidat, jarak hari sinyal paling awal, dan key insiden (tanpa kutipan atau judul artefak). Tanpa connection penulisan dilewati. Halaman setup punya tombol "Write test dossier" dan menampilkan hasil terakhir.
+- Panel insiden menampilkan lencana "Simulated history" untuk insiden demo.
+- Skema Forge SQL v009 `demo_artifacts` untuk pencatatan artefak demo.
+- Scope baru `manage:jira-project`, `manage:jira-configuration`, `write:confluence-space`, `write:comment:confluence`, `delete:page:confluence` untuk data demo (major version; perlu `forge install --upgrade`). Penghapusan issue memakai `write:jira-work` yang sudah ada.
 
 ### Fixed
 
+- Halaman setup kini selalu menampilkan status project/space demo setelah job selesai: peringatan untuk project/space yang sudah ada sebelumnya, dan catatan untuk project/space yang dibuat Hindsight pada Load sebelumnya dan dipertahankan oleh Remove.
+- Penutupan tiket demo S2 dan insiden selalu tercatat: baris log per tiket (berhasil: slot, key, status, resolusi; gagal: slot dan transisi yang tersedia) serta ringkasan `closures` di baris log `demo load` dan di hasil job.
+- Link kandidat Jira di panel insiden dan URL dossier di Rovo Search kini mengarah ke site (`https://<site>.atlassian.net/browse/...`), bukan ke `api.atlassian.com`. Base URL diambil dari `serverInfo.baseUrl`; link Jira yang sudah tersimpan diperbaiki saat Analyze berikutnya.
+- Insiden demo kini ditutup lewat transisi Resolve/Done/Close, bukan Cancel/Reject; bila status awal tidak punya transisi ke Done, app melewati hingga dua status perantara. Setiap penutupan issue demo (termasuk tiket S2 "Cannot Reproduce") dicatat di log dengan slot, status, dan resolusi.
+- Load demo data tidak lagi bisa menggandakan issue atau meninggalkan issue yang tak terhapus Remove bila limit 429 terjadi saat fallback pembuatan satu per satu: semua hasil bulk create dicatat dulu.
+- Pesan "Ran out of time" kini menyebut tombol yang sesuai (Load demo data, Reset to showcase, atau Remove demo data).
+- Job demo yang pengirimannya mati di tengah jalan dilanjutkan saat event dikirim ulang (lock jalan 13 menit, di bawah timeout 900 detik); bila antre ulang setelah 429 gagal, job langsung ditandai gagal alih-alih macet sampai 15 menit.
+- "Write test dossier" hanya memakai analisis yang collect-nya sudah selesai dan menampilkan pesan jelas bila belum ada; antrean `score` melewati dossier untuk job yang belum selesai atau gagal.
 - Job analisis tidak lagi macet bila finalisasi collect terhenti di tengah (status `filtering` difinalisasi ulang saat event dikirim ulang); job yang gagal diantrekan kini ditandai `failed`.
 - Lock analisis per insiden diperpanjang selama collect berjalan dan dilepas saat collect selesai atau gagal, sehingga analisis ulang bisa dimulai.
 - Collect dibatasi 10 halaman pencarian per sumber per job dan berhenti bila sumber mengembalikan halaman kosong dengan token lanjutan; sumber yang terpotong dicatat di progres job.
@@ -33,9 +48,14 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), dan p
 
 ### Security
 
+- Dossier Teamwork Graph (terlihat semua pengguna site) hanya ditulis untuk insiden demo. Penulisan untuk semua insiden adalah opt-in admin lewat setting `dossier_all_incidents` (default mati; UI menyusul minggu 6).
 - Komentar Jira yang dibatasi ke role/grup (`visibility`) dan komentar internal JSM (`jsdPublic: false`) tidak disimpan dan tidak menjadi kandidat, karena izin pembaca hanya dicek per issue.
 - Incident key divalidasi ulang sebelum masuk JQL; project/space key hanya lolos lewat regex whitelist lalu diberi tanda kutip.
 
 ### Changed
 
 - `onConnectionChange` tidak lagi menulis objek spike `atlassian:document` ke Teamwork Graph; penulisan nyata menyusul dari pipeline.
+- Antrean `score` (penilaian AI masih stub) kini menulis dossier kandidat ke Teamwork Graph setelah tiap analisis.
+- Load dan Reset hanya membuat service mapping `checkout` bila belum ada; editan admin tidak lagi ditimpa.
+- Bila project `PAY`/`INC` atau space `PLAT` sudah ada, progres job dan halaman setup menampilkan peringatan bahwa data demo ditambahkan ke sana dan dihapus oleh Remove demo data.
+- Stempel "Reviewed by" pada halaman demo ditunda ke minggu 4; semua artefak demo saat ini ditulis oleh app.
