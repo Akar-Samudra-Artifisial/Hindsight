@@ -17,7 +17,7 @@ import {
   type DemoSpec,
 } from './demoData';
 import type { DemoProgress, DemoRunResult } from './demoJob';
-import { DOSSIER_IDS_KEY, dossierId, MAX_TRACKED_DOSSIERS, parseDossierIds } from './dossier';
+import { DOSSIER_IDS_KEY, DOSSIER_STATUS_KEY, dossierId, MAX_TRACKED_DOSSIERS, parseDossierIds } from './dossier';
 import { analyzeLock, ISSUE_PROPERTY } from './jobs';
 
 /**
@@ -589,6 +589,8 @@ export async function resetShowcase(deps: SeedDeps): Promise<DemoRunResult & { i
   await deps.progress(1, 3, 'Removing previous analyses');
   await deps.repo.deleteJobsForIncident(incident.artifactKey);
   await deps.repo.releaseAppLock(analyzeLock(incident.artifactKey));
+  // The setup page would otherwise keep reporting the dossier of an analysis that no longer exists.
+  await deps.repo.setSetting(DOSSIER_STATUS_KEY, null);
   await deps.progress(2, 3, 'Writing the scenario timeline');
   const t0 = await scenarioStart(deps);
   const { events } = await preseed(slots, t0, deps);
@@ -668,6 +670,7 @@ export async function removeDemoData(
     await deps.repo.releaseAppLock(analyzeLock(incidentKey));
   }
   await deps.repo.setSetting(T0_SETTING, null);
+  await deps.repo.setSetting(DOSSIER_STATUS_KEY, null);
   return {
     complete: true,
     deletedIssues,

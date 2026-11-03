@@ -58,6 +58,8 @@ describe('canTransition', () => {
     expect(canTransition('queued', 'collecting')).toBe(true);
     expect(canTransition('collecting', 'scoring')).toBe(false);
     expect(canTransition('scoring', 'failed')).toBe(true);
+    expect(canTransition('scoring', 'done')).toBe(true);
+    expect(canTransition('filtering', 'done')).toBe(false);
     expect(canTransition('done', 'failed')).toBe(false);
   });
 });
@@ -83,6 +85,15 @@ describe('startAnalysis', () => {
     m.repo.acquireAppLock.mockResolvedValue(false);
     expect(await startAnalysis('INC-7', 30, null, deps)).toEqual({ status: 'running', jobId: 'job-active' });
     expect(m.repo.createJob).not.toHaveBeenCalled();
+  });
+
+  it('returns a job that is still scoring (lock already released) and only ignores one silent for 30 minutes', async () => {
+    m.repo.getActiveJobForIncident.mockResolvedValue({ id: 'job-scoring', status: 'scoring', updatedAt: '2026-11-24T23:50:00.000Z' } as never);
+    expect(await startAnalysis('INC-7', 30, null, deps)).toEqual({ status: 'running', jobId: 'job-scoring' });
+    expect(m.repo.createJob).not.toHaveBeenCalled();
+    expect(m.repo.releaseAppLock).toHaveBeenCalledWith('analyze:INC-7');
+    m.repo.getActiveJobForIncident.mockResolvedValue({ id: 'job-dead', status: 'scoring', updatedAt: '2026-11-24T23:00:00.000Z' } as never);
+    expect(await startAnalysis('INC-7', 30, null, deps)).toMatchObject({ status: 'started', jobId: 'job-1' });
   });
 
   it('releases the lock when queueing fails', async () => {

@@ -1,5 +1,25 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_WINDOW_DAYS, InputError, parseDemoKind, parseIncidentKey, parseServiceKey, parseServiceMapping, parseWindowDays } from '../src/core/validate';
+import {
+  DEFAULT_WINDOW_DAYS,
+  InputError,
+  parseDecision,
+  parseDemoKind,
+  parseIncidentKey,
+  parseServiceKey,
+  parseServiceMapping,
+  parseSignalId,
+  parseWindowDays,
+} from '../src/core/validate';
+
+describe('parseSignalId / parseDecision', () => {
+  it('accepts a uuid and the three decisions only', () => {
+    expect(parseSignalId(' 7D1C2F6E-4B7A-4C51-9A55-8F1D3C2A1E00 ')).toBe('7d1c2f6e-4b7a-4c51-9a55-8f1d3c2a1e00');
+    expect(() => parseSignalId("1' OR 1=1")).toThrow(InputError);
+    expect(parseDecision('Confirm')).toBe('confirm');
+    expect(parseDecision('undo')).toBe('undo');
+    expect(() => parseDecision('approve')).toThrow('decision must be confirm, reject or undo.');
+  });
+});
 
 describe('parseIncidentKey', () => {
   it('normalises case and whitespace', () => {

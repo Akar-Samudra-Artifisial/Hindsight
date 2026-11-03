@@ -6,11 +6,10 @@ import { jira } from '../adapters/jira';
 import { repo, type AnalysisJob } from '../adapters/repo';
 import { ensureSchema } from '../adapters/sql';
 import { cloudIdFromInstallContext, readSpike } from '../adapters/teamworkGraph';
-import { filterVisible } from '../core/access';
+import { decideSignal, listVisibleSignals } from '../core/decisions';
 import { INCIDENT_SLOT } from '../core/demoData';
 import { DEMO_QUEUE, publicJob, readDemoJob, startDemoJob } from '../core/demoJob';
 import { DOSSIER_STATUS_KEY, type DossierStatus } from '../core/dossier';
-import { MAX_CANDIDATES } from '../core/filter';
 import { containerNotes, existingContainerWarnings } from '../core/seed';
 import { startAnalysis } from '../core/jobs';
 import { MIGRATIONS } from '../core/migrations';
@@ -18,10 +17,12 @@ import { SchemaSettingUpError } from '../core/schema';
 import {
   InputError,
   MAX_SERVICE_MAPPINGS,
+  parseDecision,
   parseDemoKind,
   parseIncidentKey,
   parseServiceKey,
   parseServiceMapping,
+  parseSignalId,
   parseWindowDays,
 } from '../core/validate';
 
@@ -64,7 +65,6 @@ interface ResolverContext {
 const collectQueue = new Queue({ key: 'collect' });
 const scoreQueue = new Queue({ key: 'score' });
 const demoQueue = new Queue({ key: DEMO_QUEUE });
-const EXCERPT_PREVIEW = 400;
 
 /** Incident key from the payload, else the issue the panel is open on. */
 function incidentKeyOf(payload: Record<string, unknown>, ctx: ResolverContext): string {
@@ -130,9 +130,11 @@ function jobView(job: AnalysisJob) {
   };
 }
 
+const accessDeps = { visibleIssueIds: (ids: readonly string[]) => jira.visibleIssueIds(ids), visiblePageIds: (ids: readonly string[]) => confluence.visiblePageIds(ids) };
+
 /**
- * Latest analysis of the incident: job, funnel (scanned → stored → candidates) and the kept candidates the current
- * user can see; the others are only counted in `hiddenCount`.
+ * Latest analysis of the incident: job (with scoring progress), funnel (scanned → stored → candidates), the signals
+ * the current user can see (others only counted in `hiddenCount`) and how many candidates failed scoring.
  */
 resolver.define('getAnalysis', async ({ payload, context }) =>
   guarded(async () => {
@@ -143,41 +145,38 @@ resolver.define('getAnalysis', async ({ payload, context }) =>
     if (!incident) throw new InputError(`Incident ${incidentKey} was not found, or you do not have permission to view it.`);
     const [job, stored] = await Promise.all([repo.getLatestJobForIncident(incidentKey), repo.getIncident(incidentKey)]);
     const simulated = { simulated: stored?.scenarioStartedAt != null, scenarioStartedAt: stored?.scenarioStartedAt ?? null };
-    if (!job) return { ready: true, incidentKey, ...simulated, job: null, funnel: null, candidates: [], hiddenCount: 0 };
-    const kept = await repo.listKeptCandidates(job.id, MAX_CANDIDATES);
-    const events = new Map((await repo.getEventsByIds(kept.map((c) => c.eventId))).map((e) => [e.id, e]));
-    const { visible, hiddenCount } = await filterVisible(
-      kept.map((c) => ({ candidate: c, event: events.get(c.eventId) })),
-      { visibleIssueIds: (ids) => jira.visibleIssueIds(ids), visiblePageIds: (ids) => confluence.visiblePageIds(ids) },
-    );
+    const { signals, hiddenCount } = await listVisibleSignals(incidentKey, { repo, ...accessDeps });
+    if (!job) return { ready: true, incidentKey, ...simulated, job: null, funnel: null, signals, hiddenCount, scoreFailedCount: 0, scoreFailed: { quoteNotFound: 0, invalidOutput: 0 } };
+    const [counts, errors] = await Promise.all([repo.candidateStatusCounts(job.id), repo.scoreErrorCounts(job.id)]);
     return {
       ready: true,
       incidentKey,
       ...simulated,
       job: jobView(job),
       funnel: { scanned: job.scannedCount, stored: job.storedCount, candidates: job.candidateCount, truncated: job.truncatedCount },
-      candidates: visible.flatMap(({ candidate: c, event: e }) =>
-        e
-          ? [
-              {
-                id: c.id,
-                title: e.title,
-                source: e.source,
-                kind: e.kind,
-                artifactKey: e.artifactKey,
-                url: e.url,
-                daysBefore: c.daysBefore,
-                score: c.filterScore,
-                hintType: c.hintType,
-                reasons: c.reasons,
-                matchedKeywords: c.matchedKeywords,
-                excerpt: c.excerpt ? c.excerpt.slice(0, EXCERPT_PREVIEW) : null,
-              },
-            ]
-          : [],
-      ),
+      signals,
       hiddenCount,
+      scoreFailedCount: counts['score_failed'] ?? 0,
+      scoreFailed: { quoteNotFound: errors['quote_not_found'] ?? 0, invalidOutput: errors['llm_invalid_output'] ?? 0 },
     };
+  }),
+);
+
+/** Confirm / reject / undo a signal from the incident panel, as the current user (same rules as `confirm-signal`). */
+resolver.define('decideSignal', async ({ payload, context }) =>
+  guarded(async () => {
+    const ctx = context as ResolverContext;
+    const incidentKey = incidentKeyOf(payload, ctx);
+    const signalId = parseSignalId(payload['signalId']);
+    const decision = parseDecision(payload['decision']);
+    if (!ctx.accountId) throw new InputError('No user in context.');
+    await ensureSchema();
+    const result = await decideSignal(
+      { incidentKey, signalId, decision, accountId: ctx.accountId },
+      { getIncidentAsUser: (key) => jira.getIncidentAsUser(key), repo, ...accessDeps },
+    );
+    console.info('signal decision', { incidentKey, signalId, decision, status: result.status });
+    return { ready: true, ...result };
   }),
 );
 

@@ -32,11 +32,21 @@ const repoMock = vi.hoisted(() => ({
   setSetting: vi.fn(),
   acquireAppLock: vi.fn(),
   releaseAppLock: vi.fn(),
+  getLatestJobForIncident: vi.fn(),
+  getIncident: vi.fn(),
+  listSignalsForIncident: vi.fn(),
+  getEventsByIds: vi.fn(),
+  candidateStatusCounts: vi.fn(),
+  scoreErrorCounts: vi.fn(),
+  getSignal: vi.fn(),
+  updateSignalStatus: vi.fn(),
+  insertDecision: vi.fn(),
 }));
 vi.mock('../src/adapters/repo', () => ({ repo: repoMock }));
-const jiraMock = vi.hoisted(() => ({ isAdminAsUser: vi.fn() }));
+const jiraMock = vi.hoisted(() => ({ isAdminAsUser: vi.fn(), getIncidentAsUser: vi.fn(), visibleIssueIds: vi.fn() }));
 vi.mock('../src/adapters/jira', () => ({ jira: jiraMock }));
-vi.mock('../src/adapters/confluence', () => ({ confluence: {} }));
+const confluenceMock = vi.hoisted(() => ({ visiblePageIds: vi.fn() }));
+vi.mock('../src/adapters/confluence', () => ({ confluence: confluenceMock }));
 
 await import('../src/surfaces/ui');
 
@@ -124,5 +134,50 @@ describe('getDemoJob', () => {
       warnings: [],
       notes: ['Space PLAT was created by Hindsight for the demo; Remove demo data keeps it.'],
     });
+  });
+});
+
+describe('incident panel: getAnalysis and decideSignal', () => {
+  const SIG = '7d1c2f6e-4b7a-4c51-9a55-8f1d3c2a1e00';
+  const panel = { moduleKey: 'hindsight-incident', accountId: 'acc-9', extension: { issue: { key: 'INC-1' } } };
+  const row = (id: string, status: string, eventId: string, daysBefore: number) => ({ id, status, eventId, daysBefore, incidentKey: 'INC-1', signalType: 'technical_warning', quote: 'q', reason: 'r', confidence: 0.9 });
+
+  beforeEach(() => {
+    jiraMock.getIncidentAsUser.mockReset().mockResolvedValue({ id: '1', fields: {} });
+    jiraMock.visibleIssueIds.mockReset().mockResolvedValue(new Set(['100']));
+    confluenceMock.visiblePageIds.mockReset().mockResolvedValue(new Set());
+    repoMock.getLatestJobForIncident.mockReset().mockResolvedValue({ id: 'job-1', status: 'done', scope: {}, scannedCount: 9, storedCount: 8, candidateCount: 5, truncatedCount: 0, progress: { score: { done: 5, total: 5 } } });
+    repoMock.getIncident.mockReset().mockResolvedValue(undefined);
+    repoMock.listSignalsForIncident.mockReset().mockResolvedValue([row('s1', 'proposed', 'e1', 3), row('s2', 'confirmed', 'e1', 1), row('s3', 'proposed', 'e2', 9)]);
+    repoMock.getEventsByIds.mockReset().mockResolvedValue([
+      { id: 'e1', source: 'jira', artifactId: '100', title: 'PAY-1', kind: 'comment', artifactKey: 'PAY-1', url: 'https://x/browse/PAY-1' },
+      { id: 'e2', source: 'jira', artifactId: '200', title: 'secret', kind: 'issue', artifactKey: 'SEC-1', url: null },
+    ]);
+    repoMock.candidateStatusCounts.mockReset().mockResolvedValue({ scored: 4, score_failed: 1 });
+    repoMock.scoreErrorCounts.mockReset().mockResolvedValue({ llm_invalid_output: 1 });
+    repoMock.getSignal.mockReset().mockResolvedValue({ ...row(SIG, 'proposed', 'e1', 3) });
+    repoMock.updateSignalStatus.mockReset().mockResolvedValue(1);
+    repoMock.insertDecision.mockReset().mockResolvedValue(undefined);
+  });
+
+  it('getAnalysis returns visible signals (confirmed first), hidden and score-failed counts, and no decider', async () => {
+    const reply = (await call('getAnalysis', {}, panel)) as { signals: { id: string }[]; hiddenCount: number; scoreFailedCount: number; job: { status: string } };
+    expect(reply.signals.map((x) => x.id)).toEqual(['s2', 's1']);
+    expect(reply).toMatchObject({ hiddenCount: 1, scoreFailedCount: 1, scoreFailed: { quoteNotFound: 0, invalidOutput: 1 }, job: { status: 'done' } });
+    expect(JSON.stringify(reply)).not.toMatch(/acc-9|decided/);
+  });
+
+  it('getAnalysis refuses an incident the user cannot see', async () => {
+    jiraMock.getIncidentAsUser.mockResolvedValue(undefined);
+    expect(await call('getAnalysis', {}, panel)).toEqual({ error: 'Incident INC-1 was not found, or you do not have permission to view it.' });
+  });
+
+  it('decideSignal confirms as the current user and validates input', async () => {
+    expect(await call('decideSignal', { signalId: SIG, decision: 'confirm' }, panel)).toEqual({ ready: true, id: SIG, status: 'confirmed', previousStatus: 'proposed' });
+    expect(repoMock.insertDecision).toHaveBeenCalledWith({ signalId: SIG, incidentKey: 'INC-1', decision: 'confirm', decidedBy: 'acc-9' });
+    expect(await call('decideSignal', { signalId: 'x', decision: 'confirm' }, panel)).toEqual({ error: 'signalId must be a signal id returned by Find prior signals.' });
+    expect(await call('decideSignal', { signalId: SIG, decision: 'maybe' }, panel)).toEqual({ error: 'decision must be confirm, reject or undo.' });
+    repoMock.getSignal.mockResolvedValue({ ...row(SIG, 'confirmed', 'e1', 3) });
+    expect(await call('decideSignal', { signalId: SIG, decision: 'reject' }, panel)).toEqual({ error: 'This signal is already confirmed. Undo it first.' });
   });
 });

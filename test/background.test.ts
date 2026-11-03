@@ -13,7 +13,17 @@ const repoMock = vi.hoisted(() => ({
   setSetting: vi.fn(),
   getSetting: vi.fn(),
   listDemoArtifacts: vi.fn(),
+  getIncident: vi.fn(),
+  listSignalsForIncident: vi.fn(),
+  candidateStatusCounts: vi.fn(),
+  getEventsByIds: vi.fn(),
+  upsertSignals: vi.fn(),
+  markCandidates: vi.fn(),
+  deleteStaleProposedSignals: vi.fn(),
 }));
+const llm = vi.hoisted(() => ({ pickModels: vi.fn(), chatTool: vi.fn() }));
+vi.mock('@forge/llm', () => ({ chat: vi.fn(), list: vi.fn() }));
+vi.mock('../src/llm', async (importOriginal) => ({ ...(await importOriginal<typeof import('../src/llm')>()), ...llm }));
 const tw = vi.hoisted(() => ({ writeDossier: vi.fn() }));
 const jiraMock = vi.hoisted(() => ({ getIssueSelf: vi.fn() }));
 vi.mock('../src/adapters/teamworkGraph', () => tw);
@@ -211,9 +221,10 @@ describe('collectEvents', () => {
   });
 });
 
-describe('scoreCandidates (dossier, gate G3)', () => {
+describe('scoreCandidates (dossier only, gate G3)', () => {
   beforeEach(() => {
-    repoMock.getJob.mockResolvedValue({ id: JOB, incidentKey: 'INC-7', windowDays: 30, candidateCount: 3, status: 'scoring' });
+    // A job past scoring (setup "Write test dossier"): only the dossier is written, from the kept candidates.
+    repoMock.getJob.mockResolvedValue({ id: JOB, incidentKey: 'INC-7', windowDays: 30, candidateCount: 3, status: 'reaching' });
   });
 
   it('never writes the EVERYONE dossier for a non-demo incident without the opt-in', async () => {
@@ -290,6 +301,116 @@ describe('scoreCandidates (dossier, gate G3)', () => {
     expect(await scoreCandidates({ body: { jobId: JOB } })).toMatchObject({ retryOptions: { retryData: { reason: 'schema' } } });
     expect(await scoreCandidates({ body: {} })).toBeUndefined();
     expect(tw.writeDossier).not.toHaveBeenCalled();
+  });
+});
+
+describe('scoreCandidates (LLM scoring)', () => {
+  const EXCERPT = 'Heads up: the payment retry loop has no backoff. If the provider slows down, this retry loop could flood it with requests.';
+  const cand = (id: string, daysBefore: number) => ({ id, jobId: JOB, incidentKey: 'INC-7', eventId: `e-${id}`, daysBefore, excerpt: EXCERPT, textHash: 'h', status: 'kept' });
+  const scoringJob = { id: JOB, incidentKey: 'INC-7', windowDays: 30, candidateCount: 3, status: 'scoring', modelFast: null, promptVersion: null, progress: {}, scope: {} };
+
+  beforeEach(() => {
+    repoMock.getJob.mockResolvedValue(scoringJob);
+    repoMock.getIncident.mockResolvedValue({ summary: 'Checkout payments failing', keywords: ['payment', 'retry'] });
+    repoMock.listSignalsForIncident.mockReset().mockResolvedValueOnce([]).mockResolvedValue([{ status: 'proposed', daysBefore: 12 }]);
+    repoMock.candidateStatusCounts.mockReset().mockResolvedValue({ kept: 3 });
+    repoMock.listKeptCandidates.mockReset().mockResolvedValueOnce([cand('c1', 12), cand('c2', 3), cand('c3', 6)]).mockResolvedValue([]);
+    repoMock.getEventsByIds.mockReset().mockResolvedValue([{ id: 'e-c1', source: 'jira', title: 'PAY-12 retries' }]);
+    repoMock.upsertSignals.mockReset().mockResolvedValue(1);
+    repoMock.markCandidates.mockReset().mockResolvedValue(1);
+    repoMock.deleteStaleProposedSignals.mockReset().mockResolvedValue(0);
+    llm.pickModels.mockReset().mockResolvedValue({ fast: 'claude-haiku-4-5-20251001', strong: 'claude-sonnet-4-6' });
+    llm.chatTool.mockReset().mockResolvedValue({
+      results: [
+        { candidateId: 'c1', relevant: true, signalType: 'technical_warning', quote: 'This retry loop could flood it with requests.', reason: 'Names the retry risk.', confidence: 0.9 },
+        { candidateId: 'c2', relevant: false, signalType: 'technical_warning', quote: '', reason: '', confidence: 0 },
+        { candidateId: 'c3', relevant: true, signalType: 'technical_warning', quote: 'The provider certificate expires next week.', reason: 'x', confidence: 0.5 },
+      ],
+    });
+  });
+
+  it('scores a batch, verifies quotes, finishes the job and refreshes the dossier with the signal count', async () => {
+    expect(await scoreCandidates({ body: { jobId: JOB } })).toBeUndefined();
+    expect(llm.pickModels).toHaveBeenCalledTimes(1);
+    expect(repoMock.updateJob).toHaveBeenCalledWith(JOB, { modelFast: 'claude-haiku-4-5-20251001', modelStrong: 'claude-sonnet-4-6', promptVersion: 'score-v2' });
+    expect(llm.chatTool).toHaveBeenCalledWith('claude-haiku-4-5-20251001', expect.any(Array), expect.objectContaining({ name: 'score_candidates' }));
+    expect(repoMock.upsertSignals).toHaveBeenCalledWith([expect.objectContaining({ candidateId: 'c1', signalType: 'technical_warning', daysBefore: 12, model: 'claude-haiku-4-5-20251001' })]);
+    expect(repoMock.markCandidates).toHaveBeenCalledWith(JOB, ['c1', 'c2'], 'scored', null);
+    expect(repoMock.markCandidates).toHaveBeenCalledWith(JOB, ['c3'], 'score_failed', 'quote_not_found');
+    expect(repoMock.updateJob).toHaveBeenCalledWith(JOB, expect.objectContaining({ status: 'done' }));
+    expect(repoMock.deleteStaleProposedSignals).toHaveBeenCalledWith('INC-7', expect.objectContaining({ id: JOB }));
+    // The cleanup runs before `done`, so a redelivery after a crash still repeats it.
+    const doneCall = repoMock.updateJob.mock.calls.findIndex(([, patch]) => (patch as { status?: string }).status === 'done');
+    expect(repoMock.deleteStaleProposedSignals.mock.invocationCallOrder[0]!).toBeLessThan(repoMock.updateJob.mock.invocationCallOrder[doneCall]!);
+    expect(console.info).toHaveBeenCalledWith('llm models', { jobId: JOB, fast: 'claude-haiku-4-5-20251001', strong: 'claude-sonnet-4-6' });
+    expect(console.info).toHaveBeenCalledWith('score batch', { jobId: JOB, size: 3, signals: 1, failed: 1, done: 3, total: 3 });
+    expect(console.info).toHaveBeenCalledWith('score done', expect.objectContaining({ jobId: JOB, signals: 1, failed: 1 }));
+    const [, doc] = tw.writeDossier.mock.calls[0] as [string, { description: string }];
+    expect(doc.description).toContain('1 early signal found among 3 candidates in the 30 days before the incident; the earliest 12 days before');
+    expect(doc.description).not.toContain('retry loop');
+    expect(console.info).toHaveBeenCalledWith('dossier written', expect.objectContaining({ incidentKey: 'INC-7' }));
+    // Logs never carry artifact text or quotes.
+    const logged = JSON.stringify([(console.info as unknown as { mock: { calls: unknown[] } }).mock.calls, (console.warn as unknown as { mock: { calls: unknown[] } }).mock.calls]);
+    expect(logged).not.toContain('flood');
+    expect(repoMock.releaseAppLock).toHaveBeenCalledWith(`job:${JOB}`);
+  });
+
+  it('stores the verbatim span of the excerpt as the quote, not the model rendering', async () => {
+    await scoreCandidates({ body: { jobId: JOB } });
+    expect(repoMock.upsertSignals).toHaveBeenCalledWith([expect.objectContaining({ quote: 'this retry loop could flood it with requests.' })]);
+  });
+
+  it('does not mark the job done when the stale cleanup fails, so a redelivery can repeat it', async () => {
+    repoMock.deleteStaleProposedSignals.mockRejectedValue(new Error('sql down'));
+    await expect(scoreCandidates({ body: { jobId: JOB } })).rejects.toThrow('sql down');
+    expect(repoMock.updateJob).not.toHaveBeenCalledWith(JOB, expect.objectContaining({ status: 'done' }));
+    expect(repoMock.releaseAppLock).toHaveBeenCalledWith(`job:${JOB}`);
+  });
+
+  it('resumes with the stored model and progress, without picking models again', async () => {
+    repoMock.getJob.mockResolvedValue({ ...scoringJob, modelFast: 'claude-haiku-x', promptVersion: 'score-v1', progress: { score: { signals: 2 } } });
+    repoMock.candidateStatusCounts.mockResolvedValue({ kept: 3, scored: 10, score_failed: 1 });
+    await scoreCandidates({ body: { jobId: JOB, attempt: 1 } });
+    expect(llm.pickModels).not.toHaveBeenCalled();
+    expect(llm.chatTool).toHaveBeenCalledWith('claude-haiku-x', expect.any(Array), expect.anything());
+    expect(console.info).toHaveBeenCalledWith('score batch', { jobId: JOB, size: 3, signals: 1, failed: 1, done: 14, total: 14 });
+    expect(console.info).toHaveBeenCalledWith('score done', expect.objectContaining({ signals: 3, failed: 2, total: 14 }));
+  });
+
+  it('on a 429 re-queues with attempt + 1 after 60 s, and fails the job after 3 attempts', async () => {
+    llm.chatTool.mockRejectedValue(Object.assign(new Error('Too many requests'), { status: 429 }));
+    await scoreCandidates({ body: { jobId: JOB, attempt: 2 } });
+    expect(queue.push).toHaveBeenCalledWith('score', { body: { jobId: JOB, attempt: 3 }, delayInSeconds: 60 });
+    expect(repoMock.markCandidates).not.toHaveBeenCalled();
+    queue.push.mockClear();
+    repoMock.listKeptCandidates.mockResolvedValue([cand('c1', 12)]);
+    await scoreCandidates({ body: { jobId: JOB, attempt: 3 } });
+    expect(queue.push).not.toHaveBeenCalled();
+    expect(repoMock.updateJob).toHaveBeenCalledWith(JOB, expect.objectContaining({ status: 'failed', lastError: expect.stringContaining('LLM rate limited') }));
+  });
+
+  it('retries invalid output once, then marks the batch llm_invalid_output', async () => {
+    const { LlmOutputError } = await import('../src/llm');
+    llm.chatTool.mockRejectedValue(new LlmOutputError('no tool call'));
+    await scoreCandidates({ body: { jobId: JOB } });
+    expect(llm.chatTool).toHaveBeenCalledTimes(2);
+    expect(repoMock.markCandidates).toHaveBeenCalledWith(JOB, ['c1', 'c2', 'c3'], 'score_failed', 'llm_invalid_output');
+    expect(repoMock.updateJob).toHaveBeenCalledWith(JOB, expect.objectContaining({ status: 'done' }));
+  });
+
+  it('fails the job with a clear message when no Forge LLM model is available', async () => {
+    const { LlmUnavailableError } = await import('../src/llm');
+    llm.pickModels.mockRejectedValue(new LlmUnavailableError());
+    await scoreCandidates({ body: { jobId: JOB } });
+    expect(repoMock.updateJob).toHaveBeenCalledWith(JOB, expect.objectContaining({ status: 'failed', lastError: 'No Forge LLM model available' }));
+    expect(llm.chatTool).not.toHaveBeenCalled();
+    expect(repoMock.releaseAppLock).toHaveBeenCalledWith(`job:${JOB}`);
+  });
+
+  it('asks for a retry while another run holds the job lock', async () => {
+    repoMock.acquireAppLock.mockResolvedValueOnce(false);
+    expect(await scoreCandidates({ body: { jobId: JOB } })).toMatchObject({ retryOptions: { retryData: { reason: 'locked' } } });
+    expect(llm.chatTool).not.toHaveBeenCalled();
   });
 });
 

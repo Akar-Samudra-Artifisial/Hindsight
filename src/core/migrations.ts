@@ -182,6 +182,52 @@ export const MIGRATIONS: readonly Migration[] = [
       KEY idx_demo_artifacts_ref (source, artifact_id)
     )`,
   },
+  // One signal per (incident, event) across analyses; status: proposed|confirmed|rejected. A re-analysis only
+  // refreshes proposed rows. signal_type: technical_warning|customer_complaint|external_change|unanswered_question.
+  {
+    name: 'v010_create_signals',
+    statement: `CREATE TABLE IF NOT EXISTS signals (
+      id VARCHAR(36) PRIMARY KEY,
+      job_id VARCHAR(36) NOT NULL,
+      incident_key VARCHAR(64) NOT NULL,
+      event_id VARCHAR(36) NOT NULL,
+      candidate_id VARCHAR(36) NOT NULL,
+      signal_type VARCHAR(32) NOT NULL,
+      quote TEXT NOT NULL,
+      reason VARCHAR(255) NOT NULL,
+      confidence DOUBLE NOT NULL,
+      status VARCHAR(16) NOT NULL DEFAULT 'proposed',
+      days_before INT NOT NULL,
+      text_hash CHAR(64) NULL,
+      model VARCHAR(64) NOT NULL,
+      prompt_version VARCHAR(32) NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_signals_incident_event (incident_key, event_id),
+      KEY idx_signals_incident_status (incident_key, status),
+      KEY idx_signals_job (job_id)
+    )`,
+  },
+  // Audit trail of confirm/reject/undo; decided_by (accountId) is never sent to the UI or Rovo.
+  {
+    name: 'v011_create_signal_decisions',
+    statement: `CREATE TABLE IF NOT EXISTS signal_decisions (
+      id VARCHAR(36) PRIMARY KEY,
+      signal_id VARCHAR(36) NOT NULL,
+      incident_key VARCHAR(64) NOT NULL,
+      decision VARCHAR(16) NOT NULL,
+      decided_by VARCHAR(128) NOT NULL,
+      reason VARCHAR(255) NULL,
+      decided_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      KEY idx_signal_decisions_signal (signal_id, decided_at),
+      KEY idx_signal_decisions_incident (incident_key)
+    )`,
+  },
+  // Why scoring failed for a candidate: quote_not_found | llm_invalid_output.
+  {
+    name: 'v012_add_signal_candidates_score_error',
+    statement: 'ALTER TABLE signal_candidates ADD COLUMN IF NOT EXISTS score_error VARCHAR(32) NULL',
+  },
 ];
 
 /** Name of the newest migration. */

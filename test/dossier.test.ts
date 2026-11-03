@@ -34,6 +34,13 @@ describe('buildDossier', () => {
     expect(dossierText({ ...base, candidateCount: 1, earliestDaysBefore: 1 })).toContain('1 candidate early signal in the 30 days before the incident; the earliest 1 day before');
   });
 
+  it('after scoring counts signals among candidates, still without quotes', () => {
+    expect(dossierText({ ...base, signalCount: 4 })).toBe(
+      'Hindsight analysed INC-1: 4 early signals found among 5 candidates in the 30 days before the incident; the earliest 12 days before. Open the Hindsight panel on INC-1 to review them.',
+    );
+    expect(dossierText({ ...base, signalCount: 0, earliestDaysBefore: null })).toBe('Hindsight analysed INC-1: no early signals found among 5 candidates in the 30 days before the incident.');
+  });
+
   it('updateSequenceNumber increases with time so a later write replaces the earlier one', () => {
     const later = buildDossier({ ...base, now: new Date('2026-11-03T10:05:00.000Z') });
     expect(later.updateSequenceNumber).toBeGreaterThan(buildDossier(base).updateSequenceNumber);

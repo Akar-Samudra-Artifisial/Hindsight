@@ -275,9 +275,103 @@ describe('demo seed rows', () => {
     expect(rows[0]).toMatchObject({ slot: 'incident', createdByApp: true, scenarioAt: '2026-11-02T09:12:00.000Z', artifactKey: 'INC-1' });
   });
 
-  it('deleteJobsForIncident deletes candidates then jobs, one statement each', async () => {
+  it('deleteJobsForIncident deletes decisions, signals, candidates then jobs, one statement each', async () => {
     await repo.deleteJobsForIncident('INC-1');
-    expect(executeCalls().map((c) => c[0])).toEqual(['DELETE FROM signal_candidates WHERE incident_key = ?', 'DELETE FROM analysis_jobs WHERE incident_key = ?']);
+    expect(executeCalls().map((c) => c[0])).toEqual([
+      'DELETE FROM signal_decisions WHERE incident_key = ?',
+      'DELETE FROM signals WHERE incident_key = ?',
+      'DELETE FROM signal_candidates WHERE incident_key = ?',
+      'DELETE FROM analysis_jobs WHERE incident_key = ?',
+    ]);
+    expect(executeCalls().every((c) => c[1] === 'INC-1')).toBe(true);
+  });
+});
+
+describe('signals', () => {
+  const signal = (i: number) => ({
+    jobId: 'j2',
+    incidentKey: 'INC-1',
+    eventId: `e${i}`,
+    candidateId: `c${i}`,
+    signalType: 'technical_warning' as const,
+    quote: 'q'.repeat(400),
+    reason: 'Names the retry risk.',
+    confidence: 1.4,
+    daysBefore: 12,
+    textHash: null,
+    model: 'claude-haiku-4-5-20251001',
+    promptVersion: 'score-v1',
+  });
+
+  it('upsertSignals inserts proposed rows and never overwrites a confirmed or rejected signal', async () => {
+    await repo.upsertSignals(Array.from({ length: 51 }, (_, i) => signal(i)));
+    expect(executeCalls()).toHaveLength(2);
+    const [statement, ...params] = executeCalls()[1]!;
+    expect(statement).toContain('ON DUPLICATE KEY UPDATE');
+    // Every refreshed column is guarded by the proposed status, and status itself is never updated.
+    const updates = statement.slice(statement.indexOf('ON DUPLICATE KEY UPDATE') + 'ON DUPLICATE KEY UPDATE'.length).split(/,\s(?=\w+ = )/);
+    for (const u of updates) expect(u.trim()).toMatch(/^(\w+) = IF\(status = 'proposed', VALUES\(\1\), \1\)$/);
+    expect(statement).not.toMatch(/\bstatus = VALUES\(status\)/);
+    expect(params).toHaveLength(14);
+    expect(String(params[6])).toHaveLength(300);
+    expect(params[8]).toBe(1);
+    expect(params[9]).toBe('proposed');
+    expect(await repo.upsertSignals([])).toBe(0);
+  });
+
+  it('listSignalsForIncident inlines a validated LIMIT and maps rows', async () => {
+    sql.query.mockResolvedValueOnce([
+      { id: 's1', job_id: 'j', incident_key: 'INC-1', event_id: 'e', candidate_id: 'c', signal_type: 'external_change', quote: 'q', reason: 'r', confidence: '0.8', status: 'confirmed', days_before: 9, text_hash: null, model: 'm', prompt_version: 'p', created_at: '2026-11-03 10:00:00', updated_at: '2026-11-03 10:00:00' },
+    ]);
+    const rows = await repo.listSignalsForIncident('INC-1', 9999);
+    expect((queryCalls()[0] as Call)[0]).toMatch(/ORDER BY days_before DESC, id ASC LIMIT 500$/);
+    expect(rows[0]).toMatchObject({ id: 's1', status: 'confirmed', confidence: 0.8, daysBefore: 9, signalType: 'external_change' });
+  });
+
+  it('updateSignalStatus is a compare-and-set on the previous status', async () => {
+    expect(await repo.updateSignalStatus('s1', 'proposed', 'confirmed')).toBe(1);
+    expect(executeCalls()[0]).toEqual(['UPDATE signals SET status = ? WHERE id = ? AND status = ?', 'confirmed', 's1', 'proposed']);
+  });
+
+  it('deleteStaleProposedSignals removes decisions then proposed signals of strictly older jobs, keeping score_failed events', async () => {
+    sql.execute.mockResolvedValueOnce(1).mockResolvedValueOnce(2);
+    expect(await repo.deleteStaleProposedSignals('INC-1', { id: 'j2', createdAt: '2026-11-03T10:00:00.000Z' })).toBe(2);
+    const [[decisions, ...dParams], [signals, ...sParams]] = executeCalls() as [Call, Call];
+    expect(decisions).toMatch(/^DELETE FROM signal_decisions WHERE incident_key = \? AND signal_id IN \(SELECT id FROM signals WHERE /);
+    expect(signals).toMatch(/^DELETE FROM signals WHERE /);
+    for (const s of [decisions, signals]) {
+      expect(s).toContain("status = 'proposed' AND job_id <> ?");
+      expect(s).toContain('job_id IN (SELECT id FROM analysis_jobs WHERE incident_key = ? AND created_at < ?)');
+      expect(s).toContain("event_id NOT IN (SELECT event_id FROM signal_candidates WHERE job_id = ? AND status = 'score_failed')");
+    }
+    expect(sParams).toEqual(['INC-1', 'j2', 'INC-1', '2026-11-03 10:00:00', 'j2']);
+    expect(dParams).toEqual(['INC-1', ...sParams]);
+  });
+
+  it('scoreErrorCounts groups failed candidates by reason', async () => {
+    sql.query.mockResolvedValueOnce([
+      { score_error: 'quote_not_found', n: 2 },
+      { score_error: 'llm_invalid_output', n: 1 },
+    ]);
+    expect(await repo.scoreErrorCounts('j1')).toEqual({ quote_not_found: 2, llm_invalid_output: 1 });
+    expect((queryCalls()[0] as Call)[0]).toContain("status = 'score_failed' GROUP BY score_error");
+  });
+
+  it('insertDecision stores the decider for audit', async () => {
+    await repo.insertDecision({ signalId: 's1', incidentKey: 'INC-1', decision: 'confirm', decidedBy: 'acc-1' });
+    const [statement, ...params] = executeCalls()[0]!;
+    expect(statement).toContain('INSERT INTO signal_decisions');
+    expect(params.slice(1)).toEqual(['s1', 'INC-1', 'confirm', 'acc-1', null]);
+  });
+
+  it('markCandidates sets status and score_error per job; candidateStatusCounts groups by status', async () => {
+    await repo.markCandidates('j1', ['c1', 'c2'], 'score_failed', 'quote_not_found');
+    expect(executeCalls()[0]).toEqual(['UPDATE signal_candidates SET status = ?, score_error = ? WHERE job_id = ? AND id IN (?, ?)', 'score_failed', 'quote_not_found', 'j1', 'c1', 'c2']);
+    sql.query.mockResolvedValueOnce([
+      { status: 'kept', n: 3 },
+      { status: 'score_failed', n: '1' },
+    ]);
+    expect(await repo.candidateStatusCounts('j1')).toEqual({ kept: 3, score_failed: 1 });
   });
 });
 

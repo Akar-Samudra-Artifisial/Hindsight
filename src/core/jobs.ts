@@ -8,12 +8,15 @@ import { InputError, SERVICE_KEY } from './validate';
 
 export const ANALYZE_LOCK_SECONDS = 20 * 60;
 export const ISSUE_PROPERTY = 'hindsight';
+/** An active job updated within this window still counts as running for a new Analyze. */
+export const ACTIVE_JOB_FRESH_MS = 30 * 60 * 1000;
 
 const NEXT: Record<JobStatus, readonly JobStatus[]> = {
   queued: ['collecting', 'failed'],
   collecting: ['filtering', 'failed'],
   filtering: ['scoring', 'failed'],
-  scoring: ['reaching', 'failed'],
+  // Week 3 ends a job after scoring; reach (week 4) will continue from `scoring` instead.
+  scoring: ['done', 'reaching', 'failed'],
   reaching: ['proposing', 'failed'],
   proposing: ['done', 'failed'],
   done: [],
@@ -110,6 +113,13 @@ export async function startAnalysis(incidentKey: string, windowDays: number, req
   if (!(await deps.repo.acquireAppLock(lock, nowIso, ANALYZE_LOCK_SECONDS))) {
     const active = await deps.repo.getActiveJobForIncident(incidentKey);
     return { status: 'running', jobId: active?.id ?? null };
+  }
+  // The lock is released when collect finishes, but scoring still runs: no second job while it makes progress, so two
+  // analyses never score (and clean up signals) at the same time. A job silent for too long no longer blocks.
+  const active = await deps.repo.getActiveJobForIncident(incidentKey);
+  if (active && deps.now() - Date.parse(active.updatedAt) < ACTIVE_JOB_FRESH_MS) {
+    await deps.repo.releaseAppLock(lock);
+    return { status: 'running', jobId: active.id };
   }
   let jobId: string | undefined;
   try {
