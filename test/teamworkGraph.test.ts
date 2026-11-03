@@ -103,6 +103,11 @@ describe('parseConnectionChange', () => {
     expect(parseConnectionChange({ action: 'CREATED', connectionId: 'c-1', configProperties: {} })).toEqual({ action: 'CREATED', connectionId: 'c-1' });
     expect(parseConnectionChange({ action: 'deleted', connectionId: 'c-1' })).toEqual({ action: 'DELETED', connectionId: 'c-1' });
   });
+  it('reads the connection name and connector config names, ignoring non-strings', () => {
+    expect(
+      parseConnectionChange({ action: 'UPDATED', connectionId: 'c-1', name: 'Signals', configProperties: { connectorName: 'hs', flowName: 7 } }),
+    ).toEqual({ action: 'UPDATED', connectionId: 'c-1', name: 'Signals', connectorName: 'hs' });
+  });
   it.each([undefined, {}, { action: 'CREATED' }, { action: 'OTHER', connectionId: 'c' }, { action: 'CREATED', connectionId: '' }])('rejects %o', (e) => {
     expect(parseConnectionChange(e)).toBeUndefined();
   });

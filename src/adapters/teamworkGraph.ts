@@ -14,7 +14,7 @@ export const USER_TEAMS_QUERY = `query hindsight_userTeams($userId: ID!) {
   }
 }`;
 
-/** [VERIFY] Not proven in Tripwire; field shape taken from a public tutorial. */
+/** Proven in the 3 Nov 2026 spike (HTTP 200, paginated via `hasNextPage`). */
 export const USER_WORK_ITEMS_QUERY = `query hindsight_userWorkItems($userId: ID!) {
   atlassianUserAssignedJiraWorkItems(userId: $userId, first: 25) {
     edges { node { __typename ... on JiraWorkItem { key summary webUrl status { name } } } }
