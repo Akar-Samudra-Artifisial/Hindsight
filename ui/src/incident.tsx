@@ -159,8 +159,9 @@ function App() {
     invoke('startAnalysis', {})
       .then((r) => {
         const res = r as Reply;
+        // `load()` clears the error on success, so a refused Analyze must not reload (it would hide the reason).
         if ('error' in res) setError(res.error);
-        load();
+        else load();
       })
       .catch((e: unknown) => setError(errorText(e)))
       .finally(() => setBusy(false));
