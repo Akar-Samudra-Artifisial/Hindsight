@@ -97,6 +97,17 @@ describe('demo seed and admin calls', () => {
     expect(await jira.isAdminAsUser()).toBe(false);
   });
 
+  it('addComment: a plain comment, or a JSM internal note with sd.public.comment', async () => {
+    const doc = { type: 'doc' as const, version: 1 as const, content: [] };
+    api.appRequest.mockResolvedValue(reply(201, { id: 42 }));
+    expect(await jira.addComment('10001', doc)).toEqual({ id: '42' });
+    expect(bodyOf(api.appRequest.mock.calls[0] as unknown[])).toEqual({ body: doc });
+    await jira.addComment('10002', doc, { internal: true });
+    const call = api.appRequest.mock.calls[1] as unknown[];
+    expect(pathOf(call)).toBe('/rest/api/3/issue/10002/comment');
+    expect(bodyOf(call)).toEqual({ body: doc, properties: [{ key: 'sd.public.comment', value: { internal: true } }] });
+  });
+
   it('bulkCreateIssues maps rejected elements to undefined, in input order', async () => {
     api.appRequest.mockResolvedValue(reply(201, { issues: [{ id: 1, key: 'PAY-1' }, { id: 3, key: 'PAY-2' }], errors: [{ failedElementNumber: 1 }] }));
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);

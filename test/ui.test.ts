@@ -43,11 +43,17 @@ const repoMock = vi.hoisted(() => ({
   insertDecision: vi.fn(),
   listReachPaths: vi.fn(async () => []),
   listRoutes: vi.fn(async () => []),
+  listActiveRoutes: vi.fn(),
+  upsertDemoArtifact: vi.fn(),
+  getRoute: vi.fn(),
+  listAlertsForIncident: vi.fn(),
+  getAlert: vi.fn(),
+  setAlertFeedback: vi.fn(),
 }));
 vi.mock('../src/adapters/repo', () => ({ repo: repoMock }));
 const jiraMock = vi.hoisted(() => ({ isAdminAsUser: vi.fn(), getIncidentAsUser: vi.fn(), visibleIssueIds: vi.fn(), getProject: vi.fn() }));
 vi.mock('../src/adapters/jira', () => ({ jira: jiraMock }));
-const confluenceMock = vi.hoisted(() => ({ visiblePageIds: vi.fn(), findSpace: vi.fn() }));
+const confluenceMock = vi.hoisted(() => ({ visiblePageIds: vi.fn(), findSpace: vi.fn(), createFooterCommentAsUser: vi.fn() }));
 vi.mock('../src/adapters/confluence', () => ({ confluence: confluenceMock }));
 
 const lookupMock = vi.hoisted(() => ({ teamsOf: vi.fn(), contributorsOf: vi.fn() }));
@@ -87,6 +93,8 @@ describe('setup resolvers', () => {
     ['writeTestDossier', {}],
     ['teamSpike', {}],
     ['stampDemo', {}],
+    ['postProviderNotice', {}],
+    ['saveSentinelSettings', { weeklyCap: 10 }],
   ];
 
   it.each(mutations)('%s refuses calls from another module', async (name, payload) => {
@@ -248,5 +256,91 @@ describe('reach resolvers', () => {
     const panel = { moduleKey: 'hindsight-incident', accountId: 'acc-1', extension: { issue: { key: 'INC-1' } } };
     expect(await call('traceReach', { signalId: 'x' }, panel)).toEqual({ error: 'signalId must be a signal id returned by Find prior signals.' });
     expect(await call('decideRoute', { routeId: 'x' }, panel)).toEqual({ error: 'routeId must be a route id returned by Propose routes.' });
+    expect(await call('decideRoute', { routeId: '44444444-4444-4444-8444-444444444444', status: 'retired' }, panel)).toEqual({ error: 'status must be active or paused.' });
+  });
+});
+
+describe('Sentinel resolvers', () => {
+  const ROUTE = '44444444-4444-4444-8444-444444444444';
+  const ALERT = '55555555-5555-4555-8555-555555555555';
+  const panel = { moduleKey: 'hindsight-incident', accountId: 'acc-9', extension: { issue: { key: 'INC-1' } } };
+  const plat = { id: ROUTE, originIncidentKey: 'INC-1', status: 'active', sourceType: 'confluence_space', sourceKey: 'PLAT', spec: { keywords: ['tls', 'certificate'], target: { teamId: 't1', action: 'mention' } } };
+  const alert = (id: string, status: string, artifactId: string) => ({
+    id,
+    routeId: ROUTE,
+    incidentKey: 'INC-1',
+    status,
+    reason: null,
+    source: 'confluence',
+    artifactKind: 'comment',
+    artifactId,
+    artifactTitle: `Page ${artifactId}`,
+    artifactUrl: `https://x/wiki/${artifactId}`,
+    matchedKeywords: ['tls'],
+    targetTeamName: 'Arkana Payments',
+    feedback: null,
+    createdAt: '2026-11-03T10:00:00.000Z',
+  });
+
+  beforeEach(() => {
+    jiraMock.getIncidentAsUser.mockReset().mockResolvedValue({ id: '1', fields: {} });
+    jiraMock.visibleIssueIds.mockReset().mockResolvedValue(new Set());
+    confluenceMock.visiblePageIds.mockReset().mockResolvedValue(new Set(['900']));
+    confluenceMock.createFooterCommentAsUser.mockReset().mockResolvedValue({ id: '777' });
+    repoMock.listActiveRoutes.mockReset().mockResolvedValue([plat]);
+    repoMock.upsertDemoArtifact.mockReset().mockResolvedValue(undefined);
+    repoMock.listAlertsForIncident.mockReset().mockResolvedValue([alert(ALERT, 'posted', '900'), alert('a2', 'skipped', '901'), alert('a3', 'posted', '900')]);
+    repoMock.getAlert.mockReset().mockResolvedValue(alert(ALERT, 'posted', '900'));
+    repoMock.setAlertFeedback.mockReset().mockResolvedValue(1);
+  });
+
+  it('postProviderNotice comments as the admin on the demo page, records notice:<n> and queues a delayed fallback', async () => {
+    repoMock.listDemoArtifacts.mockResolvedValue([
+      { slot: 'distractor:plat-01', artifactId: '5079131', url: 'https://x/wiki/p' },
+      { slot: 'notice:1', artifactId: '5079131' },
+    ]);
+    expect(await call('postProviderNotice')).toEqual({ ready: true, n: 2, incidentKey: 'INC-1', pageUrl: 'https://x/wiki/p' });
+    expect(confluenceMock.createFooterCommentAsUser).toHaveBeenCalledWith('5079131', expect.stringContaining('tls'));
+    expect(repoMock.upsertDemoArtifact).toHaveBeenCalledWith(expect.objectContaining({ slot: 'notice:2', commentId: '777', createdByApp: false }));
+    expect(queue.push).toHaveBeenCalledWith('sentinel', {
+      body: expect.objectContaining({ source: 'confluence', kind: 'comment', commentId: '777', attempt: 1 }),
+      delayInSeconds: 20,
+    });
+  });
+
+  it('postProviderNotice needs an active PLAT route and the demo page', async () => {
+    repoMock.listActiveRoutes.mockResolvedValue([{ ...plat, sourceKey: 'OTHER' }]);
+    expect(await call('postProviderNotice')).toEqual({ error: 'There is no active route on Confluence space PLAT. Approve it on the Routes tab of the demo incident first.' });
+    repoMock.listActiveRoutes.mockResolvedValue([plat]);
+    repoMock.listDemoArtifacts.mockResolvedValue([]);
+    expect(await call('postProviderNotice')).toEqual({ error: 'The demo page is missing. Click Load demo data first.' });
+    expect(confluenceMock.createFooterCommentAsUser).not.toHaveBeenCalled();
+    expect(queue.push).not.toHaveBeenCalled();
+  });
+
+  it('getSentinelAlerts groups per route (latest + posted count) and hides artifacts the user cannot see', async () => {
+    confluenceMock.visiblePageIds.mockResolvedValue(new Set(['900']));
+    repoMock.listAlertsForIncident.mockResolvedValue([alert('a2', 'skipped', '901'), alert(ALERT, 'posted', '900'), alert('a3', 'posted', '900')]);
+    const reply = (await call('getSentinelAlerts', {}, panel)) as { byRoute: Record<string, { postedCount: number; last: { alertId: string; title: string | null; url: string | null } }> };
+    expect(reply.byRoute[ROUTE]).toMatchObject({ postedCount: 2, last: { alertId: 'a2', title: null, url: null } });
+    jiraMock.getIncidentAsUser.mockResolvedValue(undefined);
+    expect(await call('getSentinelAlerts', {}, panel)).toEqual({ error: 'Incident INC-1 was not found, or you do not have permission to view it.' });
+  });
+
+  it('alertFeedback stores feedback on a posted alert the user can see', async () => {
+    expect(await call('alertFeedback', { alertId: ALERT, feedback: 'useful' }, panel)).toMatchObject({ ready: true, alert: { alertId: ALERT, feedback: 'useful', title: 'Page 900' } });
+    expect(repoMock.setAlertFeedback).toHaveBeenCalledWith(ALERT, 'useful');
+    expect(await call('alertFeedback', { alertId: ALERT, feedback: 'meh' }, panel)).toEqual({ error: 'feedback must be useful or not_useful.' });
+    repoMock.getAlert.mockResolvedValue(alert(ALERT, 'skipped', '900'));
+    expect(await call('alertFeedback', { alertId: ALERT, feedback: 'useful' }, panel)).toEqual({ error: 'Feedback can only be given on an alert that was posted.' });
+    jiraMock.getIncidentAsUser.mockResolvedValue(undefined);
+    expect(await call('alertFeedback', { alertId: ALERT, feedback: 'useful' }, panel)).toEqual({ error: 'This alert was not found.' });
+  });
+
+  it('Sentinel settings read the default cap and validate the new one', async () => {
+    expect(await call('getSentinelSettings')).toEqual({ ready: true, weeklyCap: 50, max: 1000 });
+    expect(await call('saveSentinelSettings', { weeklyCap: '0' })).toEqual({ error: 'The weekly cap must be between 1 and 1000.' });
+    expect(await call('saveSentinelSettings', { weeklyCap: 10 })).toEqual({ ready: true, weeklyCap: 10, max: 1000 });
+    expect(repoMock.setSetting).toHaveBeenCalledWith('sentinel_weekly_cap', 10);
   });
 });

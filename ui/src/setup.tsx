@@ -436,6 +436,113 @@ function StampDemo() {
   );
 }
 
+interface SentinelSettingsReply {
+  weeklyCap?: number;
+  max?: number;
+  error?: string;
+}
+
+interface NoticeReply {
+  n?: number;
+  incidentKey?: string;
+  pageUrl?: string | null;
+  error?: string;
+}
+
+/**
+ * Sentinel: the weekly alert cap per team, and the demo trigger "Post a new provider notice" (a comment by you on
+ * the demo PLAT page with the keywords of the active PLAT route, so Sentinel alerts the owner team for real).
+ */
+function SentinelSetup() {
+  const [cap, setCap] = useState('');
+  const [max, setMax] = useState(1000);
+  const [saving, setSaving] = useState(false);
+  const [capMessage, setCapMessage] = useState<string | null>(null);
+  const [posting, setPosting] = useState(false);
+  const [notice, setNotice] = useState<{ text: string; url?: string } | null>(null);
+
+  useEffect(() => {
+    invoke('getSentinelSettings')
+      .then((r) => {
+        const res = r as SentinelSettingsReply;
+        if (res.error) setCapMessage(res.error);
+        else {
+          setCap(String(res.weeklyCap ?? ''));
+          if (res.max) setMax(res.max);
+        }
+      })
+      .catch((e: unknown) => setCapMessage(`Error: ${errorText(e)}`));
+  }, []);
+
+  const save = (e: FormEvent) => {
+    e.preventDefault();
+    setSaving(true);
+    invoke('saveSentinelSettings', { weeklyCap: cap.trim() })
+      .then((r) => {
+        const res = r as SentinelSettingsReply;
+        if (res.error) setCapMessage(res.error);
+        else {
+          setCap(String(res.weeklyCap ?? cap));
+          setCapMessage('Saved.');
+        }
+      })
+      .catch((err: unknown) => setCapMessage(`Error: ${errorText(err)}`))
+      .finally(() => setSaving(false));
+  };
+
+  const post = () => {
+    setPosting(true);
+    invoke('postProviderNotice')
+      .then((r) => {
+        const res = r as NoticeReply;
+        if (res.error) setNotice({ text: res.error });
+        else
+          setNotice({
+            text: `Provider notice #${res.n ?? '?'} posted on the demo page. Within a minute Sentinel comments there for the owner team; the alert shows on the Routes tab of ${res.incidentKey ?? 'the incident'}.`,
+            ...(res.pageUrl ? { url: res.pageUrl } : {}),
+          });
+      })
+      .catch((e: unknown) => setNotice({ text: `Error: ${errorText(e)}` }))
+      .finally(() => setPosting(false));
+  };
+
+  return (
+    <section style={s.section}>
+      <h2 style={s.h2}>Sentinel</h2>
+      <p style={s.muted}>
+        Approved routes are watched: a new comment or page in the route's source that matches its keywords gets one blameless alert comment for the owner team. Sentinel never runs on
+        content written by apps, alerts each item at most once, and keeps a daily cap across all teams (default 200).
+      </p>
+      <form onSubmit={save}>
+        <div style={s.row}>
+          <label htmlFor="sentinel-cap" style={{ fontSize: 13 }}>
+            Weekly alert cap per team
+          </label>
+          <input id="sentinel-cap" type="number" min={1} max={max} value={cap} onChange={(e) => setCap(e.target.value)} style={{ width: 90 }} />
+          <button type="submit" disabled={saving || cap.trim() === ''}>
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </form>
+      {capMessage && <p style={s.muted}>{capMessage}</p>}
+      <p style={s.muted}>Demo: approve the Confluence space PLAT route on the demo incident first, then post a vendor notice as yourself.</p>
+      <button type="button" onClick={post} disabled={posting}>
+        {posting ? 'Posting…' : 'Post a new provider notice'}
+      </button>
+      {notice && (
+        <p style={s.muted}>
+          {notice.text}{' '}
+          {notice.url && /^https:\/\//.test(notice.url) && (
+            <a href={notice.url} target="_blank" rel="noreferrer">
+              Open the page
+            </a>
+          )}
+        </p>
+      )}
+    </section>
+  );
+}
+
 /** Temporary: can this session read team membership of other accounts? Shows the raw resolver reply. */
 function TeamSpike() {
   const [accountIds, setAccountIds] = useState('');
@@ -480,6 +587,7 @@ function App() {
       <ServiceMappings refreshKey={refreshKey} />
       <DemoData onDone={onDemoDone} />
       <StampDemo />
+      <SentinelSetup />
       <DossierPanel />
       <TwgSpike />
       <TeamSpike />

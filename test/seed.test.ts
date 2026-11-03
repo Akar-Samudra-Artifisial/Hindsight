@@ -100,6 +100,9 @@ function fakeWorld(opts: { existingPageTitle?: string; incRefused?: boolean; noJ
       pages.delete(id);
     }),
     countByCql: vi.fn(async () => pages.size),
+    deleteContentV1: vi.fn(async (id: string) => {
+      calls.push(`delete-content:${id}`);
+    }),
   };
   const repo: SeedDeps['repo'] = {
     getSetting: async <T,>(k: string): Promise<T | undefined> => (settings.get(k) ?? undefined) as T | undefined,
@@ -274,6 +277,23 @@ describe('resetShowcase', () => {
     expect(w.deps.repo.releaseAppLock).toHaveBeenCalledWith('analyze:INC-15');
     expect(w.calls.length).toBe(before);
     expect(w.deps.repo.setSetting).toHaveBeenCalledWith('dossier_last', null);
+  });
+
+  it('deletes the provider notice comments and forgets their slots; a failed delete keeps the slot', async () => {
+    const w = fakeWorld();
+    await loadDemoData('acc-1', w.deps);
+    const notice = (n: number, commentId: string) =>
+      w.deps.repo.upsertDemoArtifact({ slot: `notice:${n}`, role: 'context', source: 'confluence', artifactId: '900', commentId, createdByApp: false });
+    await notice(1, '901');
+    await notice(2, '902');
+    vi.mocked(w.deps.confluence.deleteContentV1).mockImplementation(async (id: string) => {
+      if (id === '902') throw new Error('Confluence delete content 902 403: forbidden');
+    });
+    const r = await resetShowcase(w.deps);
+    expect(r).toMatchObject({ complete: true, notices: 1 });
+    expect(w.deps.confluence.deleteContentV1).toHaveBeenCalledWith('901');
+    expect(w.artifacts.has('notice:1')).toBe(false);
+    expect(w.artifacts.has('notice:2')).toBe(true);
   });
 });
 

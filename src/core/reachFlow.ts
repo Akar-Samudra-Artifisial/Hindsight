@@ -34,6 +34,8 @@ export interface ReachFlowDeps extends AccessDeps {
     | 'getSetting'
   >;
   getIncidentAsUser(key: string): Promise<unknown>;
+  /** Is the current user a Jira administrator (`mypermissions` ADMINISTER, as the user)? Gates pause/resume. */
+  isAdminAsUser(): Promise<boolean>;
   /** Site cloud id (resolver context, else looked up); null when unknown. */
   cloudId(): Promise<string | null>;
   /** Watchers of a Jira issue (with account type) as the app; throws on failure. */
@@ -251,7 +253,7 @@ export interface ReachView {
   routesNote: RoutesNote;
 }
 
-const STATUS_ORDER: Record<Route['status'], number> = { active: 0, proposed: 1, dismissed: 2 };
+const STATUS_ORDER: Record<Route['status'], number> = { active: 0, paused: 1, proposed: 2, dismissed: 3 };
 
 /** Stored reach state of an incident for the panel and the actions (no Teamwork Graph calls). */
 export async function readReach(incidentKey: string, visibleSignalIds: ReadonlySet<string>, deps: Pick<ReachFlowDeps, 'repo'>): Promise<ReachView> {
@@ -413,10 +415,40 @@ export async function activateRoute(routeId: string, accountId: string, deps: Re
   if (!route || (incidentKey && route.originIncidentKey !== incidentKey)) throw notFound;
   if (!(await deps.getIncidentAsUser(route.originIncidentKey))) throw notFound;
   if (route.status === 'active') return { route: routeView(route), changed: false };
+  if (route.status === 'paused') throw new InputError(`Route ${routeId} is paused. Resume it on the Routes tab of the Hindsight panel.`);
   if (route.status !== 'proposed') throw new InputError(`Route ${routeId} is ${route.status} and cannot be activated.`);
   if ((await deps.repo.decideRoute(route.id, 'proposed', 'active', accountId)) !== 1) throw new InputError('This route was changed by someone else. Refresh and try again.');
   await deps.refreshDossier(route.originIncidentKey);
   console.info('route decision', { incidentKey: route.originIncidentKey, routeId: route.id, status: 'active' });
   const updated = await deps.repo.getRoute(route.id);
   return { route: routeView(updated ?? { ...route, status: 'active' }), changed: true };
+}
+
+/**
+ * Pause (active → paused) or resume (paused → active) an approved route; Jira administrators only (approving a
+ * proposed route stays open to anyone who can view the incident). Sentinel only runs
+ * active routes; the rule stays frozen while paused. Already in the target status → unchanged.
+ */
+export async function setRouteRunning(
+  routeId: string,
+  to: 'active' | 'paused',
+  accountId: string,
+  deps: ReachFlowDeps,
+  incidentKey?: string,
+): Promise<{ route: RouteView; changed: boolean }> {
+  const route = await deps.repo.getRoute(routeId);
+  const notFound = new InputError(incidentKey ? `Route ${routeId} was not found on ${incidentKey}.` : `Route ${routeId} was not found.`);
+  if (!route || (incidentKey && route.originIncidentKey !== incidentKey)) throw notFound;
+  if (!(await deps.getIncidentAsUser(route.originIncidentKey))) throw notFound;
+  if (!(await deps.isAdminAsUser())) throw new InputError('Only Jira administrators can pause or resume a route.');
+  if (route.status === to) return { route: routeView(route), changed: false };
+  const from = to === 'paused' ? 'active' : 'paused';
+  if (route.status !== from) {
+    throw new InputError(to === 'paused' ? `Only an active route can be paused; route ${routeId} is ${route.status}.` : `Only a paused route can be resumed; route ${routeId} is ${route.status}.`);
+  }
+  if ((await deps.repo.decideRoute(route.id, from, to, accountId)) !== 1) throw new InputError('This route was changed by someone else. Refresh and try again.');
+  await deps.refreshDossier(route.originIncidentKey);
+  console.info('route decision', { incidentKey: route.originIncidentKey, routeId: route.id, status: to });
+  const updated = await deps.repo.getRoute(route.id);
+  return { route: routeView(updated ?? { ...route, status: to }), changed: true };
 }

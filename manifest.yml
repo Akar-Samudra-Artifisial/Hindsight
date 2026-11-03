@@ -32,11 +32,18 @@ modules:
 
   # --- Events (Sentinel) and lifecycle ---
   trigger:
+    # Sentinel. Jira events caused by this app are filtered out by Forge; Confluence has no such filter, so the
+    # handler also checks `selfGenerated` and known app accounts; the consumer checks the author and the marker.
     - key: work-event-trigger
       function: on-work-event
       events:
         - avi:jira:created:issue
         - avi:jira:commented:issue
+      filter:
+        ignoreSelf: true
+    - key: work-event-confluence
+      function: on-work-event
+      events:
         - avi:confluence:created:page
         - avi:confluence:updated:page
         - avi:confluence:created:comment

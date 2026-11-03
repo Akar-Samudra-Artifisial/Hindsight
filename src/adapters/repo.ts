@@ -404,7 +404,8 @@ export interface ReachPath extends ReachPathInput {
 }
 
 export type RouteSourceType = 'confluence_space' | 'jira_project' | 'jira_component' | 'jira_label';
-export type RouteStatus = 'proposed' | 'active' | 'dismissed';
+/** `paused`: an approved route the Sentinel does not run (Pause/Resume on the Routes tab); its rule stays frozen. */
+export type RouteStatus = 'proposed' | 'active' | 'paused' | 'dismissed';
 
 export interface RouteSpec {
   keywords: string[];
@@ -431,6 +432,42 @@ export interface Route extends RouteInput {
   activatedAt: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export type AlertStatus = 'posted' | 'skipped' | 'failed';
+export type AlertFeedback = 'useful' | 'not_useful';
+export type AlertArtifactKind = 'issue' | 'comment' | 'page';
+
+/** A Sentinel alert; never carries account ids. `commentId` is '' unless the artifact is a comment. */
+export interface AlertInput {
+  routeId: string;
+  incidentKey: string;
+  source: string;
+  artifactKind: AlertArtifactKind;
+  artifactId: string;
+  commentId: string;
+  artifactUrl: string | null;
+  artifactTitle: string | null;
+  matchedKeywords: string[];
+  targetTeamId: string | null;
+  targetTeamName: string | null;
+  status: AlertStatus;
+  reason: string | null;
+}
+
+export interface Alert extends AlertInput {
+  id: string;
+  postedCommentId: string | null;
+  feedback: AlertFeedback | null;
+  error: string | null;
+  createdAt: string;
+}
+
+export interface AlertPatch {
+  status?: AlertStatus;
+  reason?: string | null;
+  postedCommentId?: string | null;
+  error?: string | null;
 }
 
 export type DemoRole = 'container' | 'incident' | 'signal' | 'context' | 'distractor';
@@ -542,10 +579,17 @@ const ROUTE_COLS =
   'id, origin_incident_key, source_type, source_key, spec_json, reason, estimated_days_saved, max_days_before, signal_ids, score, status, rank_no, activated_at, created_at, updated_at';
 /** Explanation columns a recompute always refreshes, also on an active route (the latest trace explains it best). */
 const ROUTE_EXPLAIN_COLS = ['reason', 'estimated_days_saved', 'max_days_before', 'signal_ids', 'score'] as const;
-/** What a person approved (the rule itself) and its rank: frozen once a route is active. */
+/** What a person approved (the rule itself) and its rank: frozen once a route is active (or paused). */
 const ROUTE_FROZEN_WHEN_ACTIVE_COLS = ['spec_json', 'rank_no'] as const;
+const ALERT_COLS =
+  'id, route_id, incident_key, source, artifact_kind, artifact_id, comment_id, artifact_url, artifact_title, matched_keywords, target_team_id, target_team_name, posted_comment_id, status, reason, feedback, error, created_at';
 export const MAX_REACH_PATHS = 500;
 export const MAX_ROUTES = 50;
+/** Upper bound of active routes the Sentinel reads per event. */
+export const MAX_ACTIVE_ROUTES = 200;
+export const MAX_ALERTS = 100;
+/** Rows read per route and artifact for dedup; the gate never lets more than a handful accumulate. */
+export const MAX_ARTIFACT_ALERTS = 20;
 export const MAX_EVENT_TOUCHES = 2000;
 
 function toReachPath(r: Row): ReachPath {
@@ -581,6 +625,30 @@ function toRoute(r: Row): Route {
     activatedAt: fromSqlTs(r.activated_at),
     createdAt: requiredTs(r.created_at),
     updatedAt: requiredTs(r.updated_at),
+  };
+}
+
+function toAlert(r: Row): Alert {
+  const feedback = str(r.feedback);
+  return {
+    id: String(r.id),
+    routeId: String(r.route_id),
+    incidentKey: String(r.incident_key),
+    source: String(r.source),
+    artifactKind: String(r.artifact_kind) as AlertArtifactKind,
+    artifactId: String(r.artifact_id),
+    commentId: String(r.comment_id ?? ''),
+    artifactUrl: str(r.artifact_url),
+    artifactTitle: str(r.artifact_title),
+    matchedKeywords: parseJsonColumn<string[]>(r.matched_keywords) ?? [],
+    targetTeamId: str(r.target_team_id),
+    targetTeamName: str(r.target_team_name),
+    postedCommentId: str(r.posted_comment_id),
+    status: String(r.status) as AlertStatus,
+    reason: str(r.reason),
+    feedback: feedback === 'useful' || feedback === 'not_useful' ? feedback : null,
+    error: str(r.error),
+    createdAt: requiredTs(r.created_at),
   };
 }
 
@@ -1000,6 +1068,7 @@ export const repo = {
    */
   async deleteJobsForIncident(incidentKey: string): Promise<number> {
     await execute('DELETE FROM score_cache WHERE incident_key = ?', incidentKey);
+    await execute('DELETE FROM alerts WHERE incident_key = ?', incidentKey);
     await execute('DELETE FROM reach_paths WHERE incident_key = ?', incidentKey);
     await execute('DELETE FROM routes WHERE origin_incident_key = ?', incidentKey);
     await execute('DELETE FROM signal_decisions WHERE incident_key = ?', incidentKey);
@@ -1445,7 +1514,7 @@ export const repo = {
   async upsertRoutes(routes: readonly RouteInput[]): Promise<number> {
     const updates = [
       ...ROUTE_EXPLAIN_COLS.map((c) => `${c} = VALUES(${c})`),
-      ...ROUTE_FROZEN_WHEN_ACTIVE_COLS.map((c) => `${c} = IF(status = 'active', ${c}, VALUES(${c}))`),
+      ...ROUTE_FROZEN_WHEN_ACTIVE_COLS.map((c) => `${c} = IF(status IN ('active', 'paused'), ${c}, VALUES(${c}))`),
     ].join(', ');
     const rowPlaceholder = `(${placeholders(13)})`;
     let affected = 0;
@@ -1500,15 +1569,113 @@ export const repo = {
     return affected;
   },
 
-  /** Compare-and-set status change with the decider; `activated_at` is set when the route becomes active. */
+  /**
+   * Compare-and-set status change with the decider. `activated_at` is set when the route becomes active, kept while
+   * it is paused and cleared otherwise.
+   */
   async decideRoute(id: string, from: RouteStatus, to: RouteStatus, decidedBy: string): Promise<number> {
-    return execute(
-      `UPDATE routes SET status = ?, decided_by = ?, activated_at = ${to === 'active' ? 'CURRENT_TIMESTAMP' : 'NULL'} WHERE id = ? AND status = ?`,
-      to,
-      decidedBy.slice(0, 128),
-      id,
-      from,
+    const activated = to === 'active' ? 'CURRENT_TIMESTAMP' : to === 'paused' ? 'activated_at' : 'NULL';
+    return execute(`UPDATE routes SET status = ?, decided_by = ?, activated_at = ${activated} WHERE id = ? AND status = ?`, to, decidedBy.slice(0, 128), id, from);
+  },
+
+  // Sentinel
+  /** Active routes of every incident (Sentinel), oldest activation first; capped at `MAX_ACTIVE_ROUTES`. */
+  async listActiveRoutes(): Promise<Route[]> {
+    const rows = await query<Row>(
+      `SELECT ${ROUTE_COLS} FROM routes WHERE status = 'active' ORDER BY activated_at ASC, id ASC LIMIT ${sqlInt(MAX_ACTIVE_ROUTES, 1, MAX_ACTIVE_ROUTES)}`,
     );
+    return rows.map(toRoute);
+  },
+
+  async insertAlert(a: AlertInput): Promise<string> {
+    const id = randomUUID();
+    await execute(
+      `INSERT INTO alerts (id, route_id, incident_key, source, artifact_kind, artifact_id, comment_id, artifact_url, artifact_title, matched_keywords, target_team_id, target_team_name, status, reason)
+       VALUES (${placeholders(14)})`,
+      id,
+      a.routeId,
+      a.incidentKey,
+      a.source,
+      a.artifactKind,
+      a.artifactId.slice(0, 64),
+      a.commentId.slice(0, 64),
+      a.artifactUrl ? a.artifactUrl.slice(0, 512) : null,
+      a.artifactTitle ? a.artifactTitle.slice(0, 512) : null,
+      JSON.stringify(a.matchedKeywords),
+      a.targetTeamId ? a.targetTeamId.slice(0, 64) : null,
+      a.targetTeamName ? a.targetTeamName.slice(0, 255) : null,
+      a.status,
+      a.reason,
+    );
+    return id;
+  },
+
+  async updateAlert(id: string, patch: AlertPatch): Promise<number> {
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    if (patch.status !== undefined) {
+      sets.push('status = ?');
+      params.push(patch.status);
+    }
+    if (patch.reason !== undefined) {
+      sets.push('reason = ?');
+      params.push(patch.reason);
+    }
+    if (patch.postedCommentId !== undefined) {
+      sets.push('posted_comment_id = ?');
+      params.push(patch.postedCommentId ? patch.postedCommentId.slice(0, 64) : null);
+    }
+    if (patch.error !== undefined) {
+      sets.push('error = ?');
+      params.push(patch.error ? patch.error.slice(0, 1024) : null);
+    }
+    if (sets.length === 0) return 0;
+    return execute(`UPDATE alerts SET ${sets.join(', ')} WHERE id = ?`, ...params, id);
+  },
+
+  /** Every alert row of the route for this artifact (comment), newest first (lifetime dedup and failure backoff). */
+  async listAlertsForArtifact(routeId: string, artifactId: string, commentId: string): Promise<Alert[]> {
+    const rows = await query<Row>(
+      `SELECT ${ALERT_COLS} FROM alerts WHERE route_id = ? AND artifact_id = ? AND comment_id = ? ORDER BY created_at DESC LIMIT ${sqlInt(MAX_ARTIFACT_ALERTS, 1, MAX_ARTIFACT_ALERTS)}`,
+      routeId,
+      artifactId.slice(0, 64),
+      commentId.slice(0, 64),
+    );
+    return rows.map(toAlert);
+  },
+
+  /**
+   * Alerts posted or being posted (`failed`/`posting`) since `sinceIso`: to one team (weekly cap) or, without a
+   * team, to all teams (daily cap). Counted after the caller inserted its own row, so concurrent runs see each other.
+   */
+  async countAlertsSince(sinceIso: string, teamId?: string): Promise<number> {
+    const live = "(status = 'posted' OR (status = 'failed' AND reason = 'posting'))";
+    const rows = teamId
+      ? await query<Row>(`SELECT COUNT(*) AS n FROM alerts WHERE target_team_id = ? AND ${live} AND created_at >= ?`, teamId, toSqlTs(sinceIso))
+      : await query<Row>(`SELECT COUNT(*) AS n FROM alerts WHERE ${live} AND created_at >= ?`, toSqlTs(sinceIso));
+    return int(rows[0]?.n);
+  },
+
+  /** Newest alerts of routes that came from the incident; capped at `MAX_ALERTS`. */
+  async listAlertsForIncident(incidentKey: string, limit = MAX_ALERTS): Promise<Alert[]> {
+    const rows = await query<Row>(
+      `SELECT ${ALERT_COLS} FROM alerts WHERE incident_key = ? ORDER BY created_at DESC, id ASC LIMIT ${sqlInt(limit, 1, MAX_ALERTS)}`,
+      incidentKey,
+    );
+    return rows.map(toAlert);
+  },
+
+  async getAlert(id: string): Promise<Alert | undefined> {
+    const rows = await query<Row>(`SELECT ${ALERT_COLS} FROM alerts WHERE id = ?`, id);
+    return rows[0] ? toAlert(rows[0]) : undefined;
+  },
+
+  async setAlertFeedback(id: string, feedback: AlertFeedback): Promise<number> {
+    return execute("UPDATE alerts SET feedback = ? WHERE id = ? AND status = 'posted'", feedback, id);
+  },
+
+  async deleteAlertsForIncident(incidentKey: string): Promise<number> {
+    return execute('DELETE FROM alerts WHERE incident_key = ?', incidentKey);
   },
 
   async markCandidatesTruncated(jobId: string, ids: readonly string[]): Promise<number> {

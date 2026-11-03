@@ -1,6 +1,7 @@
 import type { AdfDoc } from '../adapters/jira';
 import type { DemoRole } from '../adapters/repo';
 import { CUSTOMER_TICKET_LABEL } from './filter';
+import { escapeXml } from './xml';
 
 /**
  * Arkana Commerce demo scenario (pure data). Three early signals before the "Checkout payments failing" incident,
@@ -293,7 +294,6 @@ export function adfParagraphs(text: string): AdfDoc {
   };
 }
 
-const escapeXml = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
 export function storageParagraphs(text: string): string {
   return text

@@ -32,7 +32,7 @@ export interface RouteView {
   estimatedDaysSaved: number;
   maxDaysBefore: number;
   reason: string;
-  status: 'proposed' | 'active' | 'dismissed';
+  status: 'proposed' | 'active' | 'paused' | 'dismissed';
   keywords: string[];
   signalIds: string[];
   activatedAt: string | null;
@@ -61,6 +61,24 @@ export interface ReachView {
   routes: RouteView[];
   routesNote: 'none_needed' | 'no_graph' | 'no_source' | null;
 }
+
+/** A Sentinel alert as returned by `getSentinelAlerts` / `alertFeedback`; title/url are null when not viewable. */
+export interface AlertView {
+  alertId: string;
+  routeId: string;
+  status: 'posted' | 'skipped' | 'failed';
+  reason: string | null;
+  source: string;
+  artifactKind: string;
+  title: string | null;
+  url: string | null;
+  matchedKeywords: string[];
+  teamName: string | null;
+  feedback: 'useful' | 'not_useful' | null;
+  createdAt: string;
+}
+
+export type AlertsByRoute = Record<string, { postedCount: number; last: AlertView }>;
 
 const SOURCE_LABEL: Record<RouteView['sourceType'], string> = {
   confluence_space: 'Confluence space',

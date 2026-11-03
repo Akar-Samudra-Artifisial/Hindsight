@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ReachPathInput, RouteInput } from '../src/adapters/repo';
-import { activateRoute, readReach, responderOf, runPropose, runTrace, type ReachFlowDeps } from '../src/core/reachFlow';
+import { activateRoute, readReach, responderOf, runPropose, runTrace, setRouteRunning, type ReachFlowDeps } from '../src/core/reachFlow';
 
 const PAYMENTS = '855b1079-8375-4d0d-a163-ddc96cdb696f';
 const PLATFORM = 'fa2a7a5c-d603-47c9-aadd-89f6017e48f3';
@@ -56,6 +56,7 @@ function makeDeps() {
   const deps = {
     repo,
     getIncidentAsUser: vi.fn(async (): Promise<unknown> => ({ id: '1' })),
+    isAdminAsUser: vi.fn(async () => true),
     visibleIssueIds: vi.fn(async (ids: readonly string[]) => new Set(ids)),
     visiblePageIds: vi.fn(async (ids: readonly string[]) => new Set(ids)),
     cloudId: vi.fn(async () => 'cloud-1'),
@@ -173,6 +174,55 @@ describe('activateRoute', () => {
     await expect(activateRoute(ROUTE, 'acc-1', deps)).rejects.toThrow('changed by someone else');
     deps.getIncidentAsUser.mockResolvedValue(undefined);
     await expect(activateRoute(ROUTE, 'acc-1', deps)).rejects.toThrow('was not found');
+  });
+
+  it('refuses a paused route (resume is a separate decision)', async () => {
+    const { deps, repo } = makeDeps();
+    repo.getRoute.mockResolvedValue({ ...route, status: 'paused' });
+    await expect(activateRoute(ROUTE, 'acc-1', deps)).rejects.toThrow('Resume it on the Routes tab');
+    expect(repo.decideRoute).not.toHaveBeenCalled();
+  });
+});
+
+describe('setRouteRunning', () => {
+  const route = { id: ROUTE, originIncidentKey: 'INC-60', status: 'active', sourceType: 'confluence_space', sourceKey: 'PLAT', spec: { keywords: [], target: { teamId: PAYMENTS, action: 'mention' } }, signalIds: [], rankNo: 1 };
+
+  it('pauses an active route and resumes a paused one, refreshing the dossier', async () => {
+    const { deps, repo } = makeDeps();
+    repo.getRoute.mockResolvedValueOnce(route).mockResolvedValueOnce({ ...route, status: 'paused' });
+    expect(await setRouteRunning(ROUTE, 'paused', 'acc-1', deps)).toMatchObject({ changed: true, route: { status: 'paused' } });
+    expect(repo.decideRoute).toHaveBeenCalledWith(ROUTE, 'active', 'paused', 'acc-1');
+    repo.getRoute.mockResolvedValueOnce({ ...route, status: 'paused' }).mockResolvedValueOnce(route);
+    expect(await setRouteRunning(ROUTE, 'active', 'acc-1', deps)).toMatchObject({ changed: true, route: { status: 'active' } });
+    expect(repo.decideRoute).toHaveBeenLastCalledWith(ROUTE, 'paused', 'active', 'acc-1');
+    expect(deps.refreshDossier).toHaveBeenCalledTimes(2);
+  });
+
+  it('is a no-op in the target status; refuses wrong statuses, other incidents and conflicts', async () => {
+    const { deps, repo } = makeDeps();
+    repo.getRoute.mockResolvedValue({ ...route, status: 'paused' });
+    expect(await setRouteRunning(ROUTE, 'paused', 'acc-1', deps)).toMatchObject({ changed: false });
+    expect(repo.decideRoute).not.toHaveBeenCalled();
+    repo.getRoute.mockResolvedValue({ ...route, status: 'proposed' });
+    await expect(setRouteRunning(ROUTE, 'paused', 'acc-1', deps)).rejects.toThrow('Only an active route can be paused');
+    await expect(setRouteRunning(ROUTE, 'active', 'acc-1', deps)).rejects.toThrow('Only a paused route can be resumed');
+    repo.getRoute.mockResolvedValue(route);
+    await expect(setRouteRunning(ROUTE, 'paused', 'acc-1', deps, 'INC-61')).rejects.toThrow('was not found on INC-61');
+    repo.decideRoute.mockResolvedValue(0);
+    await expect(setRouteRunning(ROUTE, 'paused', 'acc-1', deps)).rejects.toThrow('changed by someone else');
+  });
+
+  it('pause and resume are for Jira administrators only; approve is not gated', async () => {
+    const { deps, repo } = makeDeps();
+    deps.isAdminAsUser.mockResolvedValue(false);
+    repo.getRoute.mockResolvedValue(route);
+    await expect(setRouteRunning(ROUTE, 'paused', 'acc-1', deps)).rejects.toThrow('Only Jira administrators can pause or resume a route.');
+    repo.getRoute.mockResolvedValue({ ...route, status: 'paused' });
+    await expect(setRouteRunning(ROUTE, 'active', 'acc-1', deps)).rejects.toThrow('Only Jira administrators');
+    expect(repo.decideRoute).not.toHaveBeenCalled();
+    repo.getRoute.mockResolvedValueOnce({ ...route, status: 'proposed' }).mockResolvedValueOnce(route);
+    expect(await activateRoute(ROUTE, 'acc-1', deps)).toMatchObject({ changed: true });
+    expect(deps.isAdminAsUser).toHaveBeenCalledTimes(2);
   });
 });
 

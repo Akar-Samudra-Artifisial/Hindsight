@@ -16,6 +16,7 @@ export function reachDeps(contextCloudId: string | undefined): ReachFlowDeps {
   return {
     repo,
     getIncidentAsUser: (key) => jira.getIncidentAsUser(key),
+    isAdminAsUser: () => jira.isAdminAsUser(),
     visibleIssueIds: (ids) => jira.visibleIssueIds(ids),
     visiblePageIds: (ids) => confluence.visiblePageIds(ids),
     cloudId: async () => contextCloudId ?? (await jira.cloudId()),

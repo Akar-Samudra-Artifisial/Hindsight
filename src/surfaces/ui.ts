@@ -3,28 +3,34 @@ import { Queue } from '@forge/events';
 import Resolver from '@forge/resolver';
 import { confluence } from '../adapters/confluence';
 import { jira } from '../adapters/jira';
-import { repo, type AnalysisJob } from '../adapters/repo';
+import { repo, type Alert, type AnalysisJob } from '../adapters/repo';
 import { ensureSchema } from '../adapters/sql';
 import { cloudIdFromInstallContext, createTeamLookup, readSpike } from '../adapters/teamworkGraph';
 import { decideSignal, listVisibleSignals } from '../core/decisions';
-import { INCIDENT_SLOT } from '../core/demoData';
+import { DEMO, INCIDENT_SLOT, STAMP_PAGE_SLOT } from '../core/demoData';
+import { MAX_WEEKLY_CAP, noticeText, parseWeeklyCap, SENTINEL_QUEUE, SENTINEL_WEEKLY_CAP_KEY } from '../core/sentinel';
 import { DEMO_QUEUE, publicJob, readDemoJob, startDemoJob } from '../core/demoJob';
 import { DOSSIER_STATUS_KEY, type DossierStatus } from '../core/dossier';
 import { stampDemo } from '../core/demoStamp';
-import { activateRoute, readReach, runTrace } from '../core/reachFlow';
+import { activateRoute, readReach, runTrace, setRouteRunning } from '../core/reachFlow';
 import { checkContainers, containerNotes, existingContainerWarnings, INC_SLOT } from '../core/seed';
 import { reachDeps } from './reachDeps';
 import { startAnalysis } from '../core/jobs';
 import { MIGRATIONS } from '../core/migrations';
 import { SchemaSettingUpError } from '../core/schema';
+import { escapeXml } from '../core/xml';
 import {
   InputError,
   MAX_SERVICE_MAPPINGS,
+  parseAlertFeedback,
+  parseAlertId,
   parseDecision,
   parseDemoKind,
   parseIncidentKey,
   parseOptionalSignalId,
   parseRouteId,
+  parseRouteTarget,
+  parseWeeklyCapInput,
   parseServiceKey,
   parseServiceMapping,
   parseSignalId,
@@ -200,15 +206,155 @@ resolver.define('traceReach', async ({ payload, context }) =>
   }),
 );
 
-/** Approves a proposed route (→ active) as the current user. */
+/**
+ * Route decision as the current user: approve a proposed route (→ active, the default), pause an active one
+ * (`status: 'paused'`) or resume a paused one (`status: 'active'`).
+ */
 resolver.define('decideRoute', async ({ payload, context }) =>
   guarded(async () => {
     const ctx = context as ResolverContext;
     const routeId = parseRouteId(payload['routeId']);
+    const target = parseRouteTarget(payload['status']);
     if (!ctx.accountId) throw new InputError('No user in context.');
     await ensureSchema();
-    const result = await activateRoute(routeId, ctx.accountId, reachDeps(contextCloudId(ctx)));
+    const deps = reachDeps(contextCloudId(ctx));
+    if (target === 'paused') return { ready: true, ...(await setRouteRunning(routeId, 'paused', ctx.accountId, deps)) };
+    const route = await repo.getRoute(routeId);
+    const result = route?.status === 'paused' ? await setRouteRunning(routeId, 'active', ctx.accountId, deps) : await activateRoute(routeId, ctx.accountId, deps);
     return { ready: true, ...result };
+  }),
+);
+
+// --- Sentinel ---------------------------------------------------------------------------------------
+
+interface AlertView {
+  alertId: string;
+  routeId: string;
+  status: Alert['status'];
+  reason: string | null;
+  source: string;
+  artifactKind: Alert['artifactKind'];
+  /** Null when the current user cannot view the artifact. */
+  title: string | null;
+  url: string | null;
+  matchedKeywords: string[];
+  teamName: string | null;
+  feedback: Alert['feedback'];
+  createdAt: string;
+}
+
+async function alertViews(alerts: readonly Alert[]): Promise<AlertView[]> {
+  const jiraIds = alerts.filter((a) => a.source === 'jira').map((a) => a.artifactId);
+  const pageIds = alerts.filter((a) => a.source === 'confluence').map((a) => a.artifactId);
+  const [issues, pages] = await Promise.all([
+    jiraIds.length > 0 ? jira.visibleIssueIds(jiraIds) : Promise.resolve(new Set<string>()),
+    pageIds.length > 0 ? confluence.visiblePageIds(pageIds) : Promise.resolve(new Set<string>()),
+  ]);
+  return alerts.map((a) => {
+    const visible = a.source === 'confluence' ? pages.has(a.artifactId) : issues.has(a.artifactId);
+    return {
+      alertId: a.id,
+      routeId: a.routeId,
+      status: a.status,
+      reason: a.reason,
+      source: a.source,
+      artifactKind: a.artifactKind,
+      title: visible ? a.artifactTitle : null,
+      url: visible ? a.artifactUrl : null,
+      matchedKeywords: a.matchedKeywords,
+      teamName: a.targetTeamName,
+      feedback: a.feedback,
+      createdAt: a.createdAt,
+    };
+  });
+}
+
+/** Sentinel alerts of the incident's routes: per route the number posted and the latest alert. */
+resolver.define('getSentinelAlerts', async ({ payload, context }) =>
+  guarded(async () => {
+    const ctx = context as ResolverContext;
+    const incidentKey = incidentKeyOf(payload, ctx);
+    await ensureSchema();
+    if (!(await jira.getIncidentAsUser(incidentKey))) throw new InputError(`Incident ${incidentKey} was not found, or you do not have permission to view it.`);
+    const views = await alertViews(await repo.listAlertsForIncident(incidentKey));
+    const byRoute: Record<string, { postedCount: number; last: AlertView }> = {};
+    for (const v of views) {
+      // Views are newest first, so the first one seen per route is the latest.
+      const entry = byRoute[v.routeId];
+      if (entry) entry.postedCount += v.status === 'posted' ? 1 : 0;
+      else byRoute[v.routeId] = { postedCount: v.status === 'posted' ? 1 : 0, last: v };
+    }
+    return { ready: true, incidentKey, byRoute };
+  }),
+);
+
+/** Useful / Not useful on a posted alert, as a user who can view the alert's incident. */
+resolver.define('alertFeedback', async ({ payload, context }) =>
+  guarded(async () => {
+    const ctx = context as ResolverContext;
+    const alertId = parseAlertId(payload['alertId']);
+    const feedback = parseAlertFeedback(payload['feedback']);
+    if (!ctx.accountId) throw new InputError('No user in context.');
+    await ensureSchema();
+    const alert = await repo.getAlert(alertId);
+    if (!alert || !(await jira.getIncidentAsUser(alert.incidentKey))) throw new InputError('This alert was not found.');
+    if (alert.status !== 'posted') throw new InputError('Feedback can only be given on an alert that was posted.');
+    await repo.setAlertFeedback(alertId, feedback);
+    console.info('alert feedback', { alertId, feedback });
+    const [view] = await alertViews([{ ...alert, feedback }]);
+    return { ready: true, alert: view };
+  }),
+);
+
+const sentinelQueue = new Queue({ key: SENTINEL_QUEUE });
+/** Fallback delivery of a provider notice to the consumer when the product event is filtered out as self-generated. */
+export const NOTICE_FALLBACK_DELAY_SECONDS = 20;
+const NOTICE_SLOT = /^notice:([0-9]{1,6})$/;
+
+/**
+ * Setup, admin only (demo): posts "Provider notice #n" with the keywords of the active PLAT route as a comment by
+ * the admin on the demo PLAT page, so Sentinel runs its real path on a human-written artifact. The comment is
+ * recorded as demo slot `notice:<n>`. A delayed copy is queued for the consumer too, in case the comment event is
+ * marked self-generated; a double delivery is caught by the lifetime dedup.
+ */
+resolver.define('postProviderNotice', async ({ context }) =>
+  guarded(async () => {
+    await requireSetupAdmin(context as ResolverContext, 'postProviderNotice');
+    await ensureSchema();
+    const route = (await repo.listActiveRoutes()).find((r) => r.sourceType === 'confluence_space' && r.sourceKey === DEMO.space.key);
+    if (!route) throw new InputError(`There is no active route on Confluence space ${DEMO.space.key}. Approve it on the Routes tab of the demo incident first.`);
+    const artifacts = await repo.listDemoArtifacts();
+    const page = artifacts.find((a) => a.slot === STAMP_PAGE_SLOT);
+    if (!page) throw new InputError('The demo page is missing. Click Load demo data first.');
+    const n = 1 + Math.max(0, ...artifacts.flatMap((a) => NOTICE_SLOT.exec(a.slot)?.[1] ?? []).map(Number));
+    const text = noticeText(n, route.spec.keywords);
+    const created = await confluence.createFooterCommentAsUser(page.artifactId, `<p>${escapeXml(text)}</p>`);
+    await repo.upsertDemoArtifact({ slot: `notice:${n}`, role: 'context', source: 'confluence', artifactId: page.artifactId, commentId: created.id, url: page.url, createdByApp: false });
+    await sentinelQueue.push({
+      body: { v: 1, source: 'confluence', kind: 'comment', artifactId: '', commentId: created.id, eventType: 'avi:confluence:created:comment', attempt: 1 },
+      delayInSeconds: NOTICE_FALLBACK_DELAY_SECONDS,
+    });
+    console.info('provider notice posted', { n, routeId: route.id });
+    return { ready: true, n, incidentKey: route.originIncidentKey, pageUrl: page.url };
+  }),
+);
+
+resolver.define('getSentinelSettings', async ({ context }) =>
+  guarded(async () => {
+    await requireSetupAdmin(context as ResolverContext, 'getSentinelSettings');
+    await ensureSchema();
+    return { ready: true, weeklyCap: parseWeeklyCap(await repo.getSetting<unknown>(SENTINEL_WEEKLY_CAP_KEY)), max: MAX_WEEKLY_CAP };
+  }),
+);
+
+resolver.define('saveSentinelSettings', async ({ payload, context }) =>
+  guarded(async () => {
+    await requireSetupAdmin(context as ResolverContext, 'saveSentinelSettings');
+    const weeklyCap = parseWeeklyCapInput(payload['weeklyCap'], MAX_WEEKLY_CAP);
+    await ensureSchema();
+    await repo.setSetting(SENTINEL_WEEKLY_CAP_KEY, weeklyCap);
+    console.info('sentinel settings saved', { weeklyCap });
+    return { ready: true, weeklyCap, max: MAX_WEEKLY_CAP };
   }),
 );
 

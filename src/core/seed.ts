@@ -36,7 +36,7 @@ export interface SeedDeps {
   >;
   confluence: Pick<
     ConfluenceClient,
-    'findSpace' | 'createSpace' | 'findPageByTitle' | 'createPage' | 'addPageLabel' | 'createFooterComment' | 'deletePage' | 'countByCql'
+    'findSpace' | 'createSpace' | 'findPageByTitle' | 'createPage' | 'addPageLabel' | 'createFooterComment' | 'deletePage' | 'countByCql' | 'deleteContentV1'
   >;
   repo: Pick<
     Repo,
@@ -690,23 +690,44 @@ export async function loadDemoData(accountId: string, deps: SeedDeps): Promise<L
 }
 
 /** Reset to showcase: forgets the analyses of the demo incident and re-writes the scenario rows (no artifact is recreated). */
-export async function resetShowcase(deps: SeedDeps): Promise<DemoRunResult & { incidentKey: string; events: number }> {
-  const slots = new Slots(await deps.repo.listDemoArtifacts(), deps);
+export async function resetShowcase(deps: SeedDeps): Promise<DemoRunResult & { incidentKey: string; events: number; notices: number }> {
+  const recorded = await deps.repo.listDemoArtifacts();
+  const slots = new Slots(recorded, deps);
   const incident = slots.get(INCIDENT_SLOT);
   if (!incident?.artifactKey) throw new SeedError('There is no demo incident yet. Click Load demo data first.');
   await deps.progress(1, 3, 'Removing previous analyses');
+  // Also removes the Sentinel alerts of the incident's routes.
   await deps.repo.deleteJobsForIncident(incident.artifactKey);
   await deps.repo.releaseAppLock(analyzeLock(incident.artifactKey));
+  const notices = await removeProviderNotices(recorded, deps);
   // The setup page would otherwise keep reporting the dossier of an analysis that no longer exists.
   await deps.repo.setSetting(DOSSIER_STATUS_KEY, null);
   await deps.progress(2, 3, 'Writing the scenario timeline');
   const t0 = await scenarioStart(deps);
   const { events } = await preseed(slots, t0, deps);
   await deps.progress(3, 3, 'Done');
-  return { complete: true, incidentKey: incident.artifactKey, events };
+  return { complete: true, incidentKey: incident.artifactKey, events, notices };
 }
 
 const errorText = (err: unknown): string => (err instanceof Error ? err.message : String(err)).slice(0, 300);
+
+/**
+ * Deletes the demo "provider notice" comments (slots `notice:<n>`) and forgets their slots. Best effort: a comment
+ * that cannot be deleted is only logged and its slot kept, so the next Reset tries again. Returns how many went.
+ */
+async function removeProviderNotices(recorded: readonly DemoArtifact[], deps: Pick<SeedDeps, 'confluence' | 'repo'>): Promise<number> {
+  const removed: string[] = [];
+  for (const notice of recorded.filter((a) => a.slot.startsWith('notice:') && a.commentId !== '')) {
+    try {
+      await deps.confluence.deleteContentV1(notice.commentId);
+      removed.push(notice.slot);
+    } catch (err) {
+      console.warn('provider notice not deleted', { slot: notice.slot, error: errorText(err) });
+    }
+  }
+  if (removed.length > 0) await deps.repo.deleteDemoArtifacts(removed);
+  return removed.length;
+}
 
 /**
  * Deletes the tracked demo dossiers (plus the current demo incident's) from Teamwork Graph. Never throws: without an
