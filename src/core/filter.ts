@@ -23,6 +23,15 @@ export const RISK_TERMS =
 const EXTERNAL_CHANGE = /\b(deprecat\w*|vendor\w*|end[ -]of[ -]life|eol|sunset\w*)\b/i;
 const JSM_DISMISSED = /(cannot|can't|can not|could not|couldn't) reproduce|won'?t (do|fix)/i;
 
+/**
+ * Label of a customer ticket kept in a non-service project (the demo on a site without Jira Service Management):
+ * scored like a JSM ticket (closed-without-fix bonus, `customer_complaint` hint).
+ */
+export const CUSTOMER_TICKET_LABEL = 'hindsight-demo-customer';
+
+/** JSM ticket, or a Jira work item labelled as a customer ticket. */
+export const isCustomerTicket = (ev: Pick<CollectedEvent, 'source' | 'labels'>): boolean => ev.source === 'jsm' || (ev.source === 'jira' && ev.labels.includes(CUSTOMER_TICKET_LABEL));
+
 export type HintType = 'external_change' | 'unanswered_question' | 'customer_complaint' | 'technical_warning';
 
 export interface CollectedEvent {
@@ -128,7 +137,8 @@ export function filterEvent(ev: CollectedEvent, incident: IncidentContext): Cand
     score += POINTS.unanswered;
     reasons.push('unanswered_question');
   }
-  if (ev.source === 'jsm' && (JSM_DISMISSED.test(ev.resolutionName ?? '') || (ev.statusCategory === 'done' && matched.length > 0))) {
+  const customer = isCustomerTicket(ev);
+  if (customer && (JSM_DISMISSED.test(ev.resolutionName ?? '') || (ev.statusCategory === 'done' && matched.length > 0))) {
     score += POINTS.jsmDismissed;
     reasons.push('jsm_closed_without_fix');
   }
@@ -139,7 +149,7 @@ export function filterEvent(ev: CollectedEvent, incident: IncidentContext): Cand
     ? 'external_change'
     : unanswered
       ? 'unanswered_question'
-      : ev.source === 'jsm'
+      : customer
         ? 'customer_complaint'
         : 'technical_warning';
   const hit = firstHit(ev.text, new Set(matched.map((k) => k.stem)));

@@ -34,7 +34,17 @@ async function request<T>(as: As, method: Method, path: Route, body?: unknown): 
   });
   const text = await res.text();
   if (!res.ok) throw new JiraError(res.status, messageOf(res.status, text));
-  return (text ? JSON.parse(text) : undefined) as T;
+  return parseBody<T>(text, `${method} ${path.value.split('?')[0]}`);
+}
+
+/** A 2xx body as JSON; an empty body is undefined, a non-JSON body an error naming the endpoint (not the body). */
+export function parseBody<T>(text: string, endpoint: string): T {
+  if (!text.trim()) return undefined as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`Jira ${endpoint} returned a response that is not JSON (${text.length} characters)`);
+  }
 }
 
 export function isJiraRateLimited(err: unknown): boolean {
@@ -261,6 +271,22 @@ export const jira = {
     } catch (err) {
       if (err instanceof JiraError && err.status === 404) return undefined;
       throw err;
+    }
+  },
+
+  /**
+   * Whether Jira Service Management projects can be created on this site (`project/type/service_desk/accessible`):
+   * false on 404 (JSM not installed or licensed), undefined when the check itself fails (the caller then tries).
+   */
+  async serviceDeskAvailable(): Promise<boolean | undefined> {
+    try {
+      await request<unknown>('app', 'GET', route`/rest/api/3/project/type/service_desk/accessible`);
+      return true;
+    } catch (err) {
+      if (isJiraRateLimited(err)) throw err;
+      if (err instanceof JiraError && err.status === 404) return false;
+      console.warn('jira service desk check failed', { error: err instanceof Error ? err.message.slice(0, 200) : String(err) });
+      return undefined;
     }
   },
 

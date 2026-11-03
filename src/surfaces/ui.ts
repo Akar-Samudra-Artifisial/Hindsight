@@ -12,7 +12,7 @@ import { DEMO_QUEUE, publicJob, readDemoJob, startDemoJob } from '../core/demoJo
 import { DOSSIER_STATUS_KEY, type DossierStatus } from '../core/dossier';
 import { stampDemo } from '../core/demoStamp';
 import { activateRoute, readReach, runTrace } from '../core/reachFlow';
-import { containerNotes, existingContainerWarnings } from '../core/seed';
+import { checkContainers, containerNotes, existingContainerWarnings, INC_SLOT } from '../core/seed';
 import { reachDeps } from './reachDeps';
 import { startAnalysis } from '../core/jobs';
 import { MIGRATIONS } from '../core/migrations';
@@ -386,13 +386,18 @@ resolver.define('getDemoJob', async ({ context }) =>
     await requireSetupAdmin(context as ResolverContext, 'getDemoJob');
     await ensureSchema();
     const job = await readDemoJob({ repo, now: Date.now });
-    const artifacts = await repo.listDemoArtifacts();
+    const recorded = await repo.listDemoArtifacts();
+    // Checked only between jobs (the page polls every 2 s while one runs; a Load re-checks containers itself).
+    const active = job?.status === 'queued' || job?.status === 'running';
+    const { present: artifacts, missingNotes } = active ? { present: recorded, missingNotes: [] } : await checkContainers(recorded, { jira, confluence });
     return {
       ready: true,
       job: job ? publicJob(job) : null,
-      incidentKey: artifacts.find((a) => a.slot === INCIDENT_SLOT)?.artifactKey ?? null,
+      // The incident went with a deleted INC project.
+      incidentKey:
+        recorded.some((a) => a.slot === INC_SLOT) && !artifacts.some((a) => a.slot === INC_SLOT) ? null : (artifacts.find((a) => a.slot === INCIDENT_SLOT)?.artifactKey ?? null),
       warnings: existingContainerWarnings(artifacts),
-      notes: containerNotes(artifacts).filter((n) => !existingContainerWarnings(artifacts).includes(n)),
+      notes: [...missingNotes, ...containerNotes(artifacts).filter((n) => !existingContainerWarnings(artifacts).includes(n))],
     };
   }),
 );

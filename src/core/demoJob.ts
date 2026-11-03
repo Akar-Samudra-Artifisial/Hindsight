@@ -219,7 +219,11 @@ export async function runDemoJob(jobId: string, attempt: number, deps: RunDemoJo
       : deps.isRateLimited(err)
         ? 'Atlassian kept rate limiting the demo job. Wait a minute and click the button again.'
         : deps.userMessage(err);
-    if (message === undefined) console.error(`${label} failed`, { error: err instanceof Error ? `${err.name}: ${err.message}`.slice(0, 500) : String(err) });
+    if (message === undefined) {
+      // The stack holds file:line frames only (no artifact content), so the failing call can be found from the log.
+      const stack = err instanceof Error ? (err.stack ?? '').split('\n').slice(1, 6).map((l) => l.trim()) : [];
+      console.error(`${label} failed`, { error: err instanceof Error ? `${err.name}: ${err.message}`.slice(0, 500) : String(err), stack });
+    }
     else console.warn(`${label} stopped`, { message });
     await write({ status: 'failed', error: message ?? `${label} failed. Check the app logs.` }).catch((writeErr: unknown) => {
       console.error('demo job: could not record the failure', { error: writeErr instanceof Error ? writeErr.message : String(writeErr) });

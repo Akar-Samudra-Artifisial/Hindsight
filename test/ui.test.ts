@@ -45,9 +45,9 @@ const repoMock = vi.hoisted(() => ({
   listRoutes: vi.fn(async () => []),
 }));
 vi.mock('../src/adapters/repo', () => ({ repo: repoMock }));
-const jiraMock = vi.hoisted(() => ({ isAdminAsUser: vi.fn(), getIncidentAsUser: vi.fn(), visibleIssueIds: vi.fn() }));
+const jiraMock = vi.hoisted(() => ({ isAdminAsUser: vi.fn(), getIncidentAsUser: vi.fn(), visibleIssueIds: vi.fn(), getProject: vi.fn() }));
 vi.mock('../src/adapters/jira', () => ({ jira: jiraMock }));
-const confluenceMock = vi.hoisted(() => ({ visiblePageIds: vi.fn() }));
+const confluenceMock = vi.hoisted(() => ({ visiblePageIds: vi.fn(), findSpace: vi.fn() }));
 vi.mock('../src/adapters/confluence', () => ({ confluence: confluenceMock }));
 
 const lookupMock = vi.hoisted(() => ({ teamsOf: vi.fn(), contributorsOf: vi.fn() }));
@@ -65,6 +65,8 @@ const mapping = { serviceKey: 'checkout', displayName: 'Checkout', jiraProjectKe
 beforeEach(() => {
   vi.spyOn(console, 'info').mockImplementation(() => undefined);
   jiraMock.isAdminAsUser.mockReset().mockResolvedValue(true);
+  jiraMock.getProject.mockReset().mockImplementation(async (key: string) => ({ id: '1', key, name: key, projectTypeKey: 'software' }));
+  confluenceMock.findSpace.mockReset().mockImplementation(async (key: string) => ({ id: 's1', key }));
   repoMock.listServiceMappings.mockReset().mockResolvedValue([]);
   repoMock.upsertServiceMapping.mockReset().mockResolvedValue('id');
   repoMock.deleteServiceMapping.mockReset().mockResolvedValue(1);
@@ -138,11 +140,25 @@ describe('getDemoJob', () => {
 
   it('notes containers the app created on an earlier Load, also when the job is done', async () => {
     repoMock.getSetting.mockResolvedValue({ id: 'j', kind: 'load', status: 'done', step: 10, total: 10, message: 'Done', startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), accountId: 'acc-1' });
-    repoMock.listDemoArtifacts.mockResolvedValue([{ slot: 'container:space-PLAT', artifactKey: 'PLAT', createdByApp: true }]);
+    repoMock.listDemoArtifacts.mockResolvedValue([{ slot: 'container:space-PLAT', artifactKey: 'PLAT', artifactId: 's1', createdByApp: true }]);
     expect(await call('getDemoJob')).toMatchObject({
       job: { status: 'done' },
       warnings: [],
       notes: ['Space PLAT was created by Hindsight for the demo; Remove demo data keeps it.'],
+    });
+  });
+
+  it('a recorded project deleted from Jira is reported as missing, not as created by Hindsight', async () => {
+    jiraMock.getProject.mockResolvedValue(undefined);
+    repoMock.listDemoArtifacts.mockResolvedValue([
+      { slot: 'incident', artifactKey: 'INC-15', createdByApp: true },
+      { slot: 'container:project-PAY', artifactKey: 'PAY', createdByApp: true },
+      { slot: 'container:project-INC', artifactKey: 'INC', createdByApp: true, source: 'jsm' },
+    ]);
+    expect(await call('getDemoJob')).toMatchObject({
+      incidentKey: null,
+      warnings: [],
+      notes: ['Project PAY no longer exists; Load demo data will create it again.', 'Project INC no longer exists; Load demo data will create it again.'],
     });
   });
 });

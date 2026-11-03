@@ -1,5 +1,6 @@
 import type { AdfDoc } from '../adapters/jira';
 import type { DemoRole } from '../adapters/repo';
+import { CUSTOMER_TICKET_LABEL } from './filter';
 
 /**
  * Arkana Commerce demo scenario (pure data). Three early signals before the "Checkout payments failing" incident,
@@ -11,6 +12,8 @@ const DAY_MIN = 24 * 60;
 
 export const DEMO = {
   label: 'hindsight-demo',
+  /** Extra label of the INC customer tickets, so they count as customer complaints even without JSM. */
+  customerLabel: CUSTOMER_TICKET_LABEL,
   serviceKey: 'checkout',
   pay: {
     key: 'PAY',
@@ -312,7 +315,7 @@ export function pickIssueType(types: readonly { id: string; name: string }[], wa
   const fallback = by(/^task$/i) ?? types[0];
   switch (want) {
     case 'incident':
-      return by(/^(\[system\]\s*)?incident$/i) ?? types.find((t) => /incident/i.test(t.name) && !/post/i.test(t.name)) ?? fallback;
+      return by(/^(\[system\]\s*)?incident$/i) ?? types.find((t) => /incident/i.test(t.name) && !/post/i.test(t.name)) ?? by(/^bug$/i) ?? fallback;
     case 'request':
       return by(/^(\[system\]\s*)?service request$/i) ?? by(/service request/i) ?? by(/request/i) ?? fallback;
     case 'story':
