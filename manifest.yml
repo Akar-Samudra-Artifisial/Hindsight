@@ -240,8 +240,8 @@ modules:
     - key: hindsight-graph
       name: Hindsight signals
       icons:
-        light: resource:icons;hindsight.svg
-        dark: resource:icons;hindsight-dark.svg
+        light: https://raw.githubusercontent.com/Akar-Samudra-Artifisial/Hindsight/main/docs/assets/connector-icon-light.png
+        dark: https://raw.githubusercontent.com/Akar-Samudra-Artifisial/Hindsight/main/docs/assets/connector-icon-dark.png
       objectTypes:
         - atlassian:document
         - atlassian:software-service
