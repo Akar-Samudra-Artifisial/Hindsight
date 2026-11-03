@@ -116,6 +116,8 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), dan p
 
 ### Changed
 
+- `docs/PRIVACY.md` diperbarui sesuai fitur yang sudah terbukti: penulisan dossier Teamwork Graph lewat `graph:connector`, tool MCP read-only, agen dan skill Rovo, komentar Sentinel, rincian data Forge SQL (excerpt, kutipan, accountId audit), dan retensi apa adanya (penghapusan otomatis kandidat ditolak belum diimplementasikan). Kata "planned" untuk fitur yang sudah ada dihapus.
+- `README.md` dilengkapi untuk listing: fitur, kebutuhan, instalasi (placeholder link), setup, Load demo data (dengan dan tanpa JSM), connector Teamwork Graph, Enable tools MCP beserta workaround `-32014`, dan penggunaan agen Rovo.
 - Ikon app baru (huruf "H" gradien biru-ungu dengan titik sinyal amber, latar transparan) di `static/icons/hindsight.svg`; ikon connector Teamwork Graph mode gelap memakai `static/icons/hindsight-dark.svg`. Ter-deploy dev 4.16.0 dan production 2.5.0.
 - Trigger event kerja dipecah: trigger Jira (`created:issue`, `commented:issue`) memakai `filter.ignoreSelf: true`, sedangkan trigger Confluence (`created:page`, `updated:page`, `created:comment`) terpisah. Approve rute yang sedang Paused ditolak (pakai Resume).
 - Setup: setelah Load/Reset selesai tampil checklist pra-rekam ("Before recording: … Do not Reset or Analyze again while recording.").
