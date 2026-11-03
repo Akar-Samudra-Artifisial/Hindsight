@@ -4,6 +4,8 @@ import { useEffect, useState } from 'react';
 interface Status {
   surface: string;
   ready: boolean;
+  applied: number;
+  total: number;
 }
 
 /** Scaffold view: proves the resolver round-trip works. Replaced by the real view later. */
@@ -13,7 +15,13 @@ export function Placeholder({ title, surface }: { title: string; surface: string
     invoke('getStatus', { surface })
       .then((reply) => {
         const s = reply as Status | { error: string };
-        setStatus('error' in s ? `Error: ${s.error}` : s.ready ? 'Ready' : 'Not set up yet');
+        setStatus(
+          'error' in s
+            ? `Error: ${s.error}`
+            : s.ready
+              ? `Database ready (${s.applied}/${s.total} migrations)`
+              : `Setting up database (${s.applied}/${s.total} migrations)`,
+        );
       })
       .catch((e: unknown) => setStatus(`Error: ${e instanceof Error ? e.message : String(e)}`));
   }, [surface]);

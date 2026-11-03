@@ -1,7 +1,29 @@
 import { invoke } from '@forge/bridge';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { mount } from './mount';
 import { Placeholder } from './placeholder';
+
+interface GraphConnectionReply {
+  connected: boolean;
+  name: string | null;
+  updatedAt: string | null;
+}
+
+/** Teamwork Graph connector status (activated by an org admin in admin.atlassian.com → Connectors). */
+function ConnectorStatus() {
+  const [text, setText] = useState('Connector: checking…');
+  useEffect(() => {
+    invoke('getGraphConnection')
+      .then((reply) => {
+        const r = reply as GraphConnectionReply | { error: string };
+        if ('error' in r) setText(`Connector: ${r.error}`);
+        else if (!r.connected) setText('Connector: not connected');
+        else setText(`Connector: connected${r.name ? ` (${r.name})` : ''}${r.updatedAt ? `, updated ${new Date(r.updatedAt).toLocaleString()}` : ''}`);
+      })
+      .catch((e: unknown) => setText(`Connector: error ${e instanceof Error ? e.message : String(e)}`));
+  }, []);
+  return <p style={{ fontFamily: 'system-ui, sans-serif', padding: '0 16px', margin: 0 }}>{text}</p>;
+}
 
 /** Temporary: Teamwork Graph read spike. Shows the raw resolver reply. */
 function TwgSpike() {
@@ -27,6 +49,7 @@ function TwgSpike() {
 mount(
   <>
     <Placeholder title="Hindsight setup" surface="setup" />
+    <ConnectorStatus />
     <TwgSpike />
   </>,
 );

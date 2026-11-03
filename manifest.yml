@@ -305,6 +305,7 @@ permissions:
     - read:servicedesk-request
     - read:confluence-content.all
     - read:confluence-content.summary # page/comment events
+    - search:confluence # GET /wiki/rest/api/search (collect + reader permission check)
     - read:page:confluence # v2 API
     - read:space:confluence # v2 API
     - write:confluence-content # PIR section and Sentinel comments
