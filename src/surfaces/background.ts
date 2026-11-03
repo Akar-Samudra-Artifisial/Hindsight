@@ -1,12 +1,12 @@
 /**
  * Triggers, queue consumers and the scheduled trigger. Implemented so far: schema migration, the Teamwork Graph
- * `onConnectionChange` handler (stores the connection), collect, LLM scoring with the dossier write, and the demo job.
- * The rest still only log; reach, propose and Sentinel come next.
+ * `onConnectionChange` handler (stores the connection), collect, LLM scoring with the dossier write, the demo job and
+ * Sentinel (work-event triggers + `sentinel` consumer). The remaining stubs only log.
  */
 import { InvocationError, InvocationErrorCode, Queue } from '@forge/events';
-import { confluence, isConfluenceRateLimited } from '../adapters/confluence';
-import { isJiraRateLimited, jira } from '../adapters/jira';
-import { COLLECTED_JOB_STATUSES, repo, type ConnectionAction, type JobStatus, type Signal } from '../adapters/repo';
+import { confluence, ConfluenceError, isConfluenceRateLimited } from '../adapters/confluence';
+import { isJiraRateLimited, jira, JiraError } from '../adapters/jira';
+import { COLLECTED_JOB_STATUSES, repo, type ConnectionAction, type JobStatus, type ServiceMapping, type Signal } from '../adapters/repo';
 import { ensureSchema, requestMigration, runMigrations } from '../adapters/sql';
 import { deleteObjects, writeDossier } from '../adapters/teamworkGraph';
 import { COLLECT_BUDGET_MS, COLLECT_PAGES_PER_RUN, runCollectStep, type CollectDeps } from '../core/collect';
@@ -22,8 +22,28 @@ import {
   type DossierReach,
   type DossierStatus,
 } from '../core/dossier';
-import { computeMetrics } from '../core/reach';
-import { APP_ACCOUNTS_KEY, mergeAppAccounts, parseAppAccounts } from '../core/reachFlow';
+import { computeMetrics, teamUuid } from '../core/reach';
+import { APP_ACCOUNTS_KEY, mergeAppAccounts, parseAppAccounts, responderOf } from '../core/reachFlow';
+import {
+  alertGate,
+  buildAlertComment,
+  isSelfArtifact,
+  matchRoutes,
+  MAX_SENTINEL_ATTEMPTS,
+  parseDailyCap,
+  parseSentinelBody,
+  parseWeeklyCap,
+  parseWorkEvent,
+  prefilter,
+  sentinelBody,
+  sentinelLock,
+  SENTINEL_DAILY_CAP_KEY,
+  SENTINEL_QUEUE,
+  SENTINEL_WEEKLY_CAP_KEY,
+  type ArtifactPlace,
+  type SentinelBody,
+} from '../core/sentinel';
+import { adfToText, storageToText } from '../core/text';
 import { sourceTypeLabel } from '../core/routes';
 import { INCIDENT_SLOT } from '../core/demoData';
 import { analyzeLock } from '../core/jobs';
@@ -520,8 +540,290 @@ export async function demoJob(event: QueueEvent | undefined): Promise<Invocation
   });
 }
 
-export const onWorkEvent = stub('onWorkEvent');
+// --- Sentinel ------------------------------------------------------------------------------------
+
+export const SENTINEL_LOCK_SECONDS = 5 * 60;
+const sentinelQueue = new Queue({ key: SENTINEL_QUEUE });
+
+/** Queues one artifact for the `sentinel` consumer (also used by the demo "provider notice" resolver). */
+export async function enqueueSentinel(body: SentinelBody, delayInSeconds?: number): Promise<void> {
+  await sentinelQueue.push({ body: { ...body }, ...(delayInSeconds ? { delayInSeconds } : {}) });
+}
+
+const skipped = (reason: string, extra: Record<string, unknown> = {}): void => console.info('sentinel skipped', { reason, ...extra });
+
+async function knownAppAccounts(): Promise<string[]> {
+  return parseAppAccounts(await repo.getSetting<unknown>(APP_ACCOUNTS_KEY));
+}
+
+/**
+ * Jira/Confluence product events (`work-event-jira`, `work-event-confluence`): a thin filter that only queues. Skips
+ * self-generated events, events by a known app account, and events no active route could cover. Never throws.
+ */
+export async function onWorkEvent(event: ForgeEvent): Promise<void> {
+  const eventType = typeof event?.['eventType'] === 'string' ? event['eventType'].slice(0, 64) : 'unknown';
+  console.info('on-work-event received', { eventType });
+  try {
+    const e = parseWorkEvent(event);
+    if (!e) return skipped('unsupported_event', { eventType });
+    try {
+      await ensureSchema();
+    } catch (err) {
+      return skipped('schema_not_ready', { eventType, error: errorMessage(err) });
+    }
+    if (e.selfGenerated) return skipped('self', { eventType });
+    if (e.actorId && (await knownAppAccounts()).includes(e.actorId)) return skipped('self', { eventType, via: 'app_account' });
+    const routes = await repo.listActiveRoutes();
+    if (routes.length === 0) return skipped('no_active_route', { eventType });
+    if (!prefilter(e, routes)) return skipped('source_mismatch', { eventType });
+    await enqueueSentinel(sentinelBody(e));
+    console.info('sentinel queued', { eventType, source: e.source, kind: e.kind });
+  } catch (err) {
+    console.error('on-work-event failed', { eventType, error: errorMessage(err) });
+  }
+}
+
+interface SentinelArtifact {
+  place: ArtifactPlace;
+  /** Issue or page id (a Confluence comment resolves to its page). */
+  artifactId: string;
+  text: string;
+  title: string | null;
+  url: string | null;
+  author: { accountId?: string; accountType?: string } | null;
+  /** Where the alert comment goes; on a JSM issue it is an internal note. */
+  postOn: { source: 'jira'; issueId: string; internal: boolean } | { source: 'confluence'; pageId: string };
+}
+
+/** `retry`: the artifact may become readable shortly (search index lag), so the event is re-queued. */
+type LoadResult = { ok: true; artifact: SentinelArtifact } | { ok: false; reason: string; retry?: boolean };
+
+/** Reads the artifact of a queued event as the app. */
+async function loadArtifact(b: SentinelBody, siteUrl: () => Promise<string | null>): Promise<LoadResult> {
+  if (b.source === 'jira') {
+    const issue = await jira.getIssueForSentinel(b.artifactId);
+    if (!issue) return { ok: false, reason: 'not_found' };
+    const f = issue.fields ?? {};
+    const place: ArtifactPlace = {
+      source: 'jira',
+      projectKey: f.project?.key ?? null,
+      spaceKey: null,
+      componentNames: (f.components ?? []).flatMap((c) => (c.name ? [c.name] : [])),
+      labels: f.labels ?? [],
+    };
+    const base = await siteUrl();
+    const issueUrl = base ? `${base}/browse/${issue.key}` : null;
+    const postOn = { source: 'jira' as const, issueId: String(issue.id), internal: f.project?.projectTypeKey === 'service_desk' };
+    if (b.kind === 'comment') {
+      const comment = await jira.getComment(b.artifactId, b.commentId);
+      if (!comment) return { ok: false, reason: 'not_found' };
+      if (comment.visibility || comment.jsdPublic === false) return { ok: false, reason: 'restricted' };
+      return {
+        ok: true,
+        artifact: {
+          place,
+          artifactId: b.artifactId,
+          text: adfToText(comment.body),
+          title: f.summary ?? issue.key,
+          url: issueUrl ? `${issueUrl}?focusedCommentId=${b.commentId}` : null,
+          author: comment.author ?? null,
+          postOn,
+        },
+      };
+    }
+    return {
+      ok: true,
+      artifact: {
+        place,
+        artifactId: b.artifactId,
+        text: `${f.summary ?? ''}\n${adfToText(f.description)}`,
+        title: f.summary ?? issue.key,
+        url: issueUrl,
+        author: f.creator ?? f.reporter ?? null,
+        postOn,
+      },
+    };
+  }
+  const isComment = b.kind === 'comment';
+  const content = await confluence.getSentinelContent(isComment ? 'comment' : 'page', isComment ? b.commentId : b.artifactId);
+  if (content === 'not_indexed') return { ok: false, reason: 'not_indexed', retry: true };
+  if (!content) return { ok: false, reason: 'not_found' };
+  if (!content.pageId) return { ok: false, reason: 'not_on_page' };
+  const place: ArtifactPlace = { source: 'confluence', projectKey: null, spaceKey: content.spaceKey, componentNames: [], labels: [] };
+  const body = storageToText(content.storage);
+  const webui = content.links.webui;
+  const base = content.links.base ?? (webui ? await siteUrl().then((s) => (s ? `${s}/wiki` : undefined)) : undefined);
+  const url = base && webui ? `${base}${webui}` : null;
+  const postOn = { source: 'confluence' as const, pageId: content.pageId };
+  if (isComment) {
+    return { ok: true, artifact: { place, artifactId: content.pageId, text: body, title: content.pageTitle, url, author: content.createdBy ?? content.versionBy, postOn } };
+  }
+  // An update is attributed to whoever saved this version, a new page to its creator.
+  const author = b.eventType === 'avi:confluence:updated:page' ? content.versionBy : content.createdBy;
+  return { ok: true, artifact: { place, artifactId: content.pageId, text: `${content.pageTitle ?? ''}\n${body}`, title: content.pageTitle, url, author, postOn } };
+}
+
+/** 400/404/410 from Jira or Confluence will not change on retry (deleted, or an endpoint that was removed). */
+const isPermanent = (err: unknown): number | null =>
+  (err instanceof ConfluenceError || err instanceof JiraError) && [400, 404, 410].includes(err.status) ? err.status : null;
+
+/** Owner team name for an alert: the service mapping that owns the route target, else the incident's responder. */
+async function teamNameFor(teamId: string, incidentKey: string, mappings: readonly ServiceMapping[]): Promise<string | null> {
+  const mapped = mappings.find((m) => m.ownerTeamId && teamUuid(m.ownerTeamId) === teamId && m.ownerTeamName);
+  if (mapped?.ownerTeamName) return mapped.ownerTeamName;
+  const responder = responderOf(await repo.getIncident(incidentKey), mappings);
+  return responder && responder.teamId === teamId ? responder.teamName : null;
+}
+
+type SentinelOutcome = { status: 'done'; posted: number } | { status: 'rate_limited' } | { status: 'not_indexed' } | { status: 'skipped'; reason: string };
+
+async function runSentinel(b: SentinelBody): Promise<SentinelOutcome> {
+  const routes = await repo.listActiveRoutes();
+  if (routes.length === 0) return { status: 'skipped', reason: 'no_active_route' };
+  let site: Promise<string | null> | undefined;
+  const siteUrl = () => (site ??= jira.siteUrl());
+  let loaded: LoadResult;
+  try {
+    loaded = await loadArtifact(b, siteUrl);
+  } catch (err) {
+    const status = isPermanent(err);
+    if (status === null) throw err;
+    console.warn('sentinel read failed (not retried)', { source: b.source, kind: b.kind, status, error: errorMessage(err) });
+    return { status: 'skipped', reason: `read_failed_${status}` };
+  }
+  if (!loaded.ok) return loaded.retry ? { status: 'not_indexed' } : { status: 'skipped', reason: loaded.reason };
+  const a = loaded.artifact;
+  let apps = await knownAppAccounts();
+  if (a.author?.accountType === 'app' && a.author.accountId) {
+    const merged = mergeAppAccounts(apps, [a.author.accountId]);
+    if (merged.length !== apps.length) await repo.setSetting(APP_ACCOUNTS_KEY, merged);
+  }
+  if (isSelfArtifact(a.author, apps, a.text)) return { status: 'skipped', reason: 'self' };
+  const matches = matchRoutes(routes, a.place, a.text);
+  if (matches.length === 0) return { status: 'skipped', reason: 'no_match' };
+
+  const now = Date.now();
+  const weekSince = new Date(now - 7 * 24 * 3600_000).toISOString();
+  const daySince = new Date(now - 24 * 3600_000).toISOString();
+  const cap = parseWeeklyCap(await repo.getSetting<unknown>(SENTINEL_WEEKLY_CAP_KEY));
+  const dailyCap = parseDailyCap(await repo.getSetting<unknown>(SENTINEL_DAILY_CAP_KEY));
+  const mappings = await repo.listServiceMappings();
+  const alertedTeams = new Set<string>();
+  const artifact = `${b.source}:${b.kind}:${a.artifactId}${b.commentId ? `/${b.commentId}` : ''}`;
+  let posted = 0;
+
+  for (const { route, matched } of matches) {
+    console.info('sentinel matched', { routeId: route.id, artifact });
+    const teamId = route.spec.target.teamId;
+    if (alertedTeams.has(teamId)) {
+      skipped('team_already_alerted', { routeId: route.id });
+      continue;
+    }
+    const gate = alertGate(await repo.listAlertsForArtifact(route.id, a.artifactId, b.commentId), now);
+    if (!gate.go) {
+      skipped(gate.reason, { routeId: route.id });
+      continue;
+    }
+    const teamName = await teamNameFor(teamId, route.originIncidentKey, mappings);
+    const alert = {
+      routeId: route.id,
+      incidentKey: route.originIncidentKey,
+      source: b.source,
+      artifactKind: b.kind,
+      artifactId: a.artifactId,
+      commentId: b.commentId,
+      artifactUrl: a.url,
+      artifactTitle: a.title,
+      matchedKeywords: matched,
+      targetTeamId: teamId,
+      targetTeamName: teamName,
+    };
+    // Recorded (as in flight) before the caps are counted and before posting: concurrent runs count each other's
+    // rows, a crash after posting still blocks a second post (lifetime dedup), and a failure stays visible.
+    const alertId = await repo.insertAlert({ ...alert, status: 'failed', reason: 'posting' });
+    const capHit =
+      (await repo.countAlertsSince(weekSince, teamId)) > cap ? { reason: 'weekly_cap', cap } : (await repo.countAlertsSince(daySince)) > dailyCap ? { reason: 'daily_cap', cap: dailyCap } : null;
+    if (capHit) {
+      await repo.updateAlert(alertId, { status: 'skipped', reason: capHit.reason });
+      skipped(capHit.reason, { routeId: route.id, cap: capHit.cap });
+      continue;
+    }
+    const base = await siteUrl();
+    const comment = buildAlertComment({
+      teamName: teamName ?? 'the owner team',
+      incidentKey: route.originIncidentKey,
+      incidentUrl: base ? `${base}/browse/${route.originIncidentKey}` : null,
+    });
+    try {
+      const created =
+        a.postOn.source === 'jira'
+          ? await jira.addComment(a.postOn.issueId, comment.adf, { internal: a.postOn.internal })
+          : await confluence.createFooterComment(a.postOn.pageId, comment.storage);
+      await repo.updateAlert(alertId, { status: 'posted', reason: null, postedCommentId: created.id, error: null });
+      const appAuthor = (created as { authorId?: string }).authorId;
+      if (appAuthor && !apps.includes(appAuthor)) {
+        apps = mergeAppAccounts(apps, [appAuthor]);
+        await repo.setSetting(APP_ACCOUNTS_KEY, apps);
+      }
+      alertedTeams.add(teamId);
+      posted += 1;
+      console.info('alert posted', { alertId, commentId: created.id });
+    } catch (err) {
+      const rateLimited = isJiraRateLimited(err) || isConfluenceRateLimited(err);
+      await repo.updateAlert(alertId, { status: 'failed', reason: rateLimited ? 'rate_limited' : 'api_error', error: errorMessage(err) });
+      if (rateLimited) return { status: 'rate_limited' };
+      console.warn('sentinel post failed', { alertId, error: errorMessage(err) });
+    }
+  }
+  return { status: 'done', posted };
+}
+
+/**
+ * Consumer for the `sentinel` queue: under a per-artifact lock it reads the artifact as the app, skips app-written
+ * artifacts, matches active routes and posts at most one heads-up per team (lifetime dedup per route and artifact
+ * or comment, bounded failure retries, weekly cap per team, daily cap overall). 429 → re-queued after 60 s with
+ * `attempt + 1`, at most 3 attempts.
+ */
+export async function checkSentinel(event: QueueEvent | undefined): Promise<InvocationError | void> {
+  let body: SentinelBody;
+  try {
+    body = parseSentinelBody(event?.body);
+  } catch (err) {
+    console.warn('sentinel: invalid event ignored', { error: errorMessage(err) });
+    return;
+  }
+  if (!(await schemaReady('checkSentinel'))) return retryLater(SCHEMA_RETRY_SECONDS, 'schema');
+  const lock = sentinelLock(body);
+  if (!(await repo.acquireAppLock(lock, new Date().toISOString(), SENTINEL_LOCK_SECONDS))) return retryLater(SCHEMA_RETRY_SECONDS, 'locked');
+  try {
+    let outcome: SentinelOutcome;
+    try {
+      outcome = await runSentinel(body);
+    } catch (err) {
+      if (!(isJiraRateLimited(err) || isConfluenceRateLimited(err))) {
+        console.error('sentinel failed', { source: body.source, kind: body.kind, error: errorMessage(err) });
+        return;
+      }
+      outcome = { status: 'rate_limited' };
+    }
+    if (outcome.status === 'skipped') return skipped(outcome.reason, { source: body.source, kind: body.kind });
+    if (outcome.status === 'done') {
+      console.info('sentinel done', { source: body.source, kind: body.kind, posted: outcome.posted });
+      return;
+    }
+    // 429, or a comment the search index does not have yet: re-queued after 60 s, at most 3 attempts.
+    const why = outcome.status === 'not_indexed' ? 'not indexed yet' : 'rate limited';
+    if (body.attempt >= MAX_SENTINEL_ATTEMPTS) {
+      console.warn(`sentinel: ${why}, gave up`, { attempt: body.attempt });
+      return;
+    }
+    await enqueueSentinel({ ...body, attempt: body.attempt + 1 }, RATE_LIMIT_DELAY_SECONDS);
+    console.warn(`sentinel: ${why}, re-queued`, { attempt: body.attempt });
+  } finally {
+    await repo.releaseAppLock(lock);
+  }
+}
+
 export const traceReach = stub('traceReach');
 export const proposeRoutesJob = stub('proposeRoutesJob');
-export const checkSentinel = stub('checkSentinel');
 export const purgeExpired = stub('purgeExpired');

@@ -292,6 +292,34 @@ export const MIGRATIONS: readonly Migration[] = [
       PRIMARY KEY (incident_key, event_id, text_hash, prompt_version)
     )`,
   },
+  // Sentinel alerts: one row per (active route, new artifact) the Sentinel matched. status: posted|skipped|failed;
+  // reason: weekly_cap|api_error|rate_limited; feedback: useful|not_useful. No account ids are stored.
+  {
+    name: 'v016_create_alerts',
+    statement: `CREATE TABLE IF NOT EXISTS alerts (
+      id VARCHAR(36) PRIMARY KEY,
+      route_id VARCHAR(36) NOT NULL,
+      incident_key VARCHAR(64) NOT NULL,
+      source VARCHAR(32) NOT NULL,
+      artifact_kind VARCHAR(16) NOT NULL,
+      artifact_id VARCHAR(64) NOT NULL,
+      comment_id VARCHAR(64) NOT NULL DEFAULT '',
+      artifact_url VARCHAR(512) NULL,
+      artifact_title VARCHAR(512) NULL,
+      matched_keywords JSON NOT NULL,
+      target_team_id VARCHAR(64) NULL,
+      target_team_name VARCHAR(255) NULL,
+      posted_comment_id VARCHAR(64) NULL,
+      status VARCHAR(16) NOT NULL,
+      reason VARCHAR(64) NULL,
+      feedback VARCHAR(16) NULL,
+      error TEXT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      KEY idx_alerts_route_artifact (route_id, artifact_id, created_at),
+      KEY idx_alerts_team_created (target_team_id, created_at),
+      KEY idx_alerts_incident (incident_key, created_at)
+    )`,
+  },
 ];
 
 /** Name of the newest migration. */

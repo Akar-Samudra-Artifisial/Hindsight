@@ -79,6 +79,7 @@ export interface RawIssue {
     status?: { statusCategory?: { key?: string } };
     resolution?: { name?: string } | null;
     reporter?: { accountId?: string; accountType?: string } | null;
+    creator?: { accountId?: string; accountType?: string } | null;
     priority?: { name?: string } | null;
     resolutiondate?: string | null;
     comment?: { comments?: RawComment[]; total?: number; maxResults?: number; startAt?: number };
@@ -353,9 +354,35 @@ export const jira = {
     return { id: String(created.id), key: created.key };
   },
 
-  /** Adds a comment (ADF body) as the app; returns the comment id. */
-  async addComment(key: string, body: AdfDoc): Promise<{ id: string }> {
-    const created = await request<{ id: string | number }>('app', 'POST', route`/rest/api/3/issue/${key}/comment`, { body });
+  // --- Sentinel --------------------------------------------------------------------------------
+
+  /** The issue with the fields Sentinel matches on, as the app; undefined when it is gone (404). */
+  async getIssueForSentinel(id: string): Promise<RawIssue | undefined> {
+    try {
+      return await request<RawIssue>('app', 'GET', route`/rest/api/3/issue/${id}?fields=summary,description,project,components,labels,reporter,creator`);
+    } catch (err) {
+      if (err instanceof JiraError && err.status === 404) return undefined;
+      throw err;
+    }
+  },
+
+  /** One comment of an issue as the app; undefined when it is gone (404). */
+  async getComment(issueId: string, commentId: string): Promise<RawComment | undefined> {
+    try {
+      return await request<RawComment>('app', 'GET', route`/rest/api/3/issue/${issueId}/comment/${commentId}`);
+    } catch (err) {
+      if (err instanceof JiraError && err.status === 404) return undefined;
+      throw err;
+    }
+  },
+
+  /**
+   * Adds a comment (ADF body) as the app; returns the comment id. `internal` (JSM issues) makes it an internal note
+   * that customers on the portal do not see.
+   */
+  async addComment(key: string, body: AdfDoc, opts: { internal?: boolean } = {}): Promise<{ id: string }> {
+    const payload = opts.internal ? { body, properties: [{ key: 'sd.public.comment', value: { internal: true } }] } : { body };
+    const created = await request<{ id: string | number }>('app', 'POST', route`/rest/api/3/issue/${key}/comment`, payload);
     return { id: String(created.id) };
   },
 

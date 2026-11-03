@@ -45,7 +45,7 @@ function columnNames(statement: string): string[] {
 }
 
 describe('MIGRATIONS', () => {
-  it('has v001–v015, unique names in order', () => {
+  it('has v001–v016, unique names in order', () => {
     const names = MIGRATIONS.map((m) => m.name);
     expect(new Set(names).size).toBe(names.length);
     expect(names).toEqual([
@@ -64,8 +64,18 @@ describe('MIGRATIONS', () => {
       'v013_create_reach_paths',
       'v014_create_routes',
       'v015_create_score_cache',
+      'v016_create_alerts',
     ]);
-    expect(LATEST_MIGRATION).toBe('v015_create_score_cache');
+    expect(LATEST_MIGRATION).toBe('v016_create_alerts');
+  });
+
+  it('alerts index route + artifact, team + time and incident, and store no account ids', () => {
+    const alerts = MIGRATIONS.find((m) => m.name === 'v016_create_alerts')!.statement;
+    expect(alerts).toContain('KEY idx_alerts_route_artifact (route_id, artifact_id, created_at)');
+    expect(alerts).toContain('KEY idx_alerts_team_created (target_team_id, created_at)');
+    expect(alerts).toContain('KEY idx_alerts_incident (incident_key, created_at)');
+    expect(alerts).toContain('matched_keywords JSON NOT NULL');
+    expect(alerts).not.toMatch(/account/i);
   });
 
   it('score_cache is keyed by incident, event, text hash and prompt version', () => {

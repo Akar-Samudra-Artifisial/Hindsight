@@ -24,6 +24,114 @@ beforeEach(() => {
   api.userRequest.mockReset();
 });
 
+describe('confluence.getSentinelContent (v2)', () => {
+  const route = (path: string, res: unknown) => [path, res] as const;
+  const serve = (table: readonly (readonly [string, unknown])[]) =>
+    api.appRequest.mockImplementation(async (r: { value: string }) => {
+      const hit = table.find(([p]) => r.value === p);
+      return hit ? hit[1] : reply(500, { message: `unexpected ${r.value}` });
+    });
+
+  it('page: v2 body-format=storage (never none), creator/version author, space id → key', async () => {
+    serve([
+      route(
+        '/wiki/api/v2/pages/900?body-format=storage',
+        reply(200, { id: '900', title: 'Gateway notes', spaceId: '77', authorId: 'u-1', version: { authorId: 'u-2' }, body: { storage: { value: '<p>gateway</p>' } }, _links: { webui: '/spaces/PLAT/pages/900' } }),
+      ),
+      route('/wiki/api/v2/spaces/77', reply(200, { id: '77', key: 'PLAT' })),
+    ]);
+    expect(await confluence.getSentinelContent('page', '900')).toEqual({
+      type: 'page',
+      id: '900',
+      pageId: '900',
+      pageTitle: 'Gateway notes',
+      spaceKey: 'PLAT',
+      storage: '<p>gateway</p>',
+      createdBy: { accountId: 'u-1' },
+      versionBy: { accountId: 'u-2' },
+      links: { webui: '/spaces/PLAT/pages/900' },
+    });
+    expect(api.appRequest.mock.calls.map((c) => pathOf(c as unknown[])).join(' ')).not.toMatch(/body-format=none|\/rest\/api\/content/);
+  });
+
+  it('footer comment: v2 comment + parent page (title, space key)', async () => {
+    serve([
+      route(
+        '/wiki/api/v2/footer-comments/5472298?body-format=storage',
+        reply(200, { id: '5472298', pageId: '5079131', version: { authorId: 'u-3' }, body: { storage: { value: '<p>Provider notice #1</p>' } }, _links: { webui: '/spaces/PLAT/pages/5079131?focusedCommentId=5472298' } }),
+      ),
+      route('/wiki/api/v2/pages/5079131', reply(200, { id: '5079131', title: 'Build pipeline conventions', spaceId: '77' })),
+      route('/wiki/api/v2/spaces/77', reply(200, { key: 'PLAT' })),
+    ]);
+    expect(await confluence.getSentinelContent('comment', '5472298')).toMatchObject({
+      type: 'comment',
+      pageId: '5079131',
+      pageTitle: 'Build pipeline conventions',
+      spaceKey: 'PLAT',
+      storage: '<p>Provider notice #1</p>',
+      createdBy: { accountId: 'u-3' },
+    });
+  });
+
+  it('falls back to inline-comments on 404, and is undefined when neither exists', async () => {
+    serve([
+      route('/wiki/api/v2/footer-comments/5?body-format=storage', reply(404, {})),
+      route('/wiki/api/v2/inline-comments/5?body-format=storage', reply(200, { pageId: '9', version: { authorId: 'u' }, body: { storage: { value: 'x' } } })),
+      route('/wiki/api/v2/pages/9', reply(200, { title: 'T', spaceId: '1' })),
+      route('/wiki/api/v2/spaces/1', reply(404, {})),
+    ]);
+    expect(await confluence.getSentinelContent('comment', '5')).toMatchObject({ pageId: '9', pageTitle: 'T', spaceKey: null });
+    serve([route('/wiki/api/v2/footer-comments/6?body-format=storage', reply(404, {})), route('/wiki/api/v2/inline-comments/6?body-format=storage', reply(404, {}))]);
+    expect(await confluence.getSentinelContent('comment', '6')).toBeUndefined();
+  });
+
+  it('v2 comment read refused (scope) → the CQL search, with account type; not in the index yet → not_indexed', async () => {
+    api.appRequest.mockImplementation(async (r: { value: string }) => {
+      if (r.value.startsWith('/wiki/api/v2/footer-comments/')) return reply(401, { message: 'Unauthorized; scope does not match' });
+      return reply(200, {
+        results: [
+          {
+            content: {
+              id: 7,
+              type: 'comment',
+              space: { key: 'PLAT' },
+              body: { storage: { value: '<p>n</p>' } },
+              container: { id: 900, type: 'page', title: 'Conventions' },
+              history: { createdBy: { accountId: 'h', accountType: 'atlassian' } },
+              _links: { webui: '/x' },
+            },
+          },
+        ],
+        _links: { base: 'https://one.atlassian.net/wiki' },
+      });
+    });
+    expect(await confluence.getSentinelContent('comment', '7')).toMatchObject({
+      pageId: '900',
+      pageTitle: 'Conventions',
+      spaceKey: 'PLAT',
+      createdBy: { accountId: 'h', accountType: 'atlassian' },
+      links: { base: 'https://one.atlassian.net/wiki', webui: '/x' },
+    });
+    const searchCall = api.appRequest.mock.calls.map((c) => pathOf(c as unknown[])).find((p) => p.startsWith('/wiki/rest/api/search'))!;
+    expect(new URL(searchCall, 'https://x.invalid').searchParams.get('cql')).toBe('id = 7 AND type = comment');
+    api.appRequest.mockImplementation(async (r: { value: string }) => (r.value.startsWith('/wiki/api/v2/') ? reply(403, {}) : reply(200, { results: [] })));
+    expect(await confluence.getSentinelContent('comment', '7')).toBe('not_indexed');
+  });
+
+  it('410 (removed endpoint) throws a ConfluenceError with the status; a non-numeric id is never requested', async () => {
+    serve([route('/wiki/api/v2/pages/900?body-format=storage', reply(410, { message: 'This deprecated endpoint has been removed.' }))]);
+    await expect(confluence.getSentinelContent('page', '900')).rejects.toMatchObject({ status: 410 });
+    api.appRequest.mockClear();
+    expect(await confluence.getSentinelContent('page', '1 OR 1=1')).toBeUndefined();
+    expect(api.appRequest).not.toHaveBeenCalled();
+  });
+
+  it('createFooterComment returns the v2 author (the app account)', async () => {
+    api.appRequest.mockResolvedValue(reply(200, { id: 50, version: { authorId: 'app-hs' } }));
+    expect(await confluence.createFooterComment('9', '<p>x</p>')).toEqual({ id: '50', via: 'v2', authorId: 'app-hs' });
+  });
+});
+
 describe('confluence.searchContent', () => {
   it('sends CQL with expansions and parses results, base and next cursor', async () => {
     api.appRequest.mockResolvedValue(

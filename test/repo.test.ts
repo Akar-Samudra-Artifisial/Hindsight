@@ -278,10 +278,11 @@ describe('demo seed rows', () => {
     expect(rows[0]).toMatchObject({ slot: 'incident', createdByApp: true, scenarioAt: '2026-11-02T09:12:00.000Z', artifactKey: 'INC-1' });
   });
 
-  it('deleteJobsForIncident deletes the score cache, reach paths, routes, decisions, signals, candidates then jobs, one statement each', async () => {
+  it('deleteJobsForIncident deletes the score cache, alerts, reach paths, routes, decisions, signals, candidates then jobs, one statement each', async () => {
     await repo.deleteJobsForIncident('INC-1');
     expect(executeCalls().map((c) => c[0])).toEqual([
       'DELETE FROM score_cache WHERE incident_key = ?',
+      'DELETE FROM alerts WHERE incident_key = ?',
       'DELETE FROM reach_paths WHERE incident_key = ?',
       'DELETE FROM routes WHERE origin_incident_key = ?',
       'DELETE FROM signal_decisions WHERE incident_key = ?',
@@ -464,9 +465,9 @@ describe('routes', () => {
     const next = { ...stored };
     for (const u of clause.split(/,\s(?=\w+ = )/).map((x) => x.trim())) {
       const plain = /^(\w+) = VALUES\(\1\)$/.exec(u);
-      const guarded = /^(\w+) = IF\(status = 'active', \1, VALUES\(\1\)\)$/.exec(u);
+      const guarded = /^(\w+) = IF\(status IN \('active', 'paused'\), \1, VALUES\(\1\)\)$/.exec(u);
       if (plain) next[plain[1]!] = incoming[plain[1]!];
-      else if (guarded) next[guarded[1]!] = stored['status'] === 'active' ? stored[guarded[1]!] : incoming[guarded[1]!];
+      else if (guarded) next[guarded[1]!] = stored['status'] === 'active' || stored['status'] === 'paused' ? stored[guarded[1]!] : incoming[guarded[1]!];
       else throw new Error(`unexpected update ${u}`);
     }
     return next;
@@ -482,6 +483,8 @@ describe('routes', () => {
     expect(after).toMatchObject({ reason: 'stopped at Arkana Platform', status: 'active', rank_no: 1, spec_json: '{"old":true}', decided_by: 'acc-1', activated_at: '2026-11-03 07:40:00', estimated_days_saved: 11 });
     // A proposed route takes everything new.
     expect(applyDuplicate(statement, { ...stored, status: 'proposed' }, incoming)).toMatchObject({ rank_no: 3, spec_json: incoming['spec_json'], status: 'proposed' });
+    // A paused route keeps its approved rule too.
+    expect(applyDuplicate(statement, { ...stored, status: 'paused' }, incoming)).toMatchObject({ rank_no: 1, spec_json: '{"old":true}', status: 'paused' });
   });
 
   it('upsertRoutes inserts proposed rows and never demotes an active route', async () => {
@@ -489,7 +492,7 @@ describe('routes', () => {
     const [statement, ...params] = executeCalls()[0]!;
     expect(statement).toContain('ON DUPLICATE KEY UPDATE');
     const updates = statement.slice(statement.indexOf('ON DUPLICATE KEY UPDATE') + 'ON DUPLICATE KEY UPDATE'.length).split(/,\s(?=\w+ = )/);
-    for (const u of updates) expect(u.trim()).toMatch(/^(reason|estimated_days_saved|max_days_before|signal_ids|score) = VALUES\(\1\)$|^(spec_json|rank_no) = IF\(status = 'active', \2, VALUES\(\2\)\)$/);
+    for (const u of updates) expect(u.trim()).toMatch(/^(reason|estimated_days_saved|max_days_before|signal_ids|score) = VALUES\(\1\)$|^(spec_json|rank_no) = IF\(status IN \('active', 'paused'\), \2, VALUES\(\2\)\)$/);
     expect(statement).not.toMatch(/\bstatus = VALUES\(status\)/);
     expect(statement).not.toMatch(/decided_by = VALUES/);
     expect(params).toHaveLength(26);
@@ -514,6 +517,101 @@ describe('routes', () => {
     await repo.decideRoute('ro1', 'active', 'dismissed', 'acc-1');
     expect(executeCalls()[0]).toEqual(['UPDATE routes SET status = ?, decided_by = ?, activated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = ?', 'active', 'acc-1', 'ro1', 'proposed']);
     expect(executeCalls()[1]![0]).toContain('activated_at = NULL');
+  });
+
+  it('decideRoute keeps the activation time while paused', async () => {
+    await repo.decideRoute('ro1', 'active', 'paused', 'acc-1');
+    expect(executeCalls()[0]).toEqual(['UPDATE routes SET status = ?, decided_by = ?, activated_at = activated_at WHERE id = ? AND status = ?', 'paused', 'acc-1', 'ro1', 'active']);
+  });
+
+  it('listActiveRoutes reads only active routes across incidents, capped', async () => {
+    sql.query.mockResolvedValueOnce([]);
+    await repo.listActiveRoutes();
+    expect(queryCalls()[0]![0]).toMatch(/FROM routes WHERE status = 'active' ORDER BY activated_at ASC, id ASC LIMIT 200$/);
+  });
+});
+
+describe('alerts', () => {
+  const alert = {
+    routeId: 'ro1',
+    incidentKey: 'INC-1',
+    source: 'confluence',
+    artifactKind: 'comment' as const,
+    artifactId: '900',
+    commentId: '901',
+    artifactUrl: 'https://x/wiki/900',
+    artifactTitle: 'Gateway notes',
+    matchedKeywords: ['gateway'],
+    targetTeamId: 't-pay',
+    targetTeamName: 'Arkana Payments',
+    status: 'failed' as const,
+    reason: 'posting',
+  };
+
+  it('insertAlert writes one row with JSON keywords and returns a new id', async () => {
+    const id = await repo.insertAlert(alert);
+    const [statement, ...params] = executeCalls()[0]!;
+    expect(statement).toMatch(/^INSERT INTO alerts \(id, route_id, incident_key, source, artifact_kind, artifact_id, comment_id, artifact_url, artifact_title, matched_keywords, target_team_id, target_team_name, status, reason\)/);
+    expect(params).toEqual([id, 'ro1', 'INC-1', 'confluence', 'comment', '900', '901', 'https://x/wiki/900', 'Gateway notes', '["gateway"]', 't-pay', 'Arkana Payments', 'failed', 'posting']);
+  });
+
+  it('updateAlert sets only the given columns; nothing to set → no statement', async () => {
+    await repo.updateAlert('a1', { status: 'posted', reason: null, postedCommentId: '777' });
+    expect(executeCalls()[0]).toEqual(['UPDATE alerts SET status = ?, reason = ?, posted_comment_id = ? WHERE id = ?', 'posted', null, '777', 'a1']);
+    expect(await repo.updateAlert('a1', {})).toBe(0);
+    expect(executeCalls()).toHaveLength(1);
+  });
+
+  it('listAlertsForArtifact reads every status of the route and artifact (comment), without a time window', async () => {
+    sql.query.mockResolvedValueOnce([]);
+    expect(await repo.listAlertsForArtifact('ro1', '900', '901')).toEqual([]);
+    const [statement, ...params] = queryCalls()[0]!;
+    expect(statement).toContain('WHERE route_id = ? AND artifact_id = ? AND comment_id = ? ORDER BY created_at DESC LIMIT 20');
+    expect(statement).not.toContain('status =');
+    expect(statement).not.toContain('created_at >=');
+    expect(params).toEqual(['ro1', '900', '901']);
+  });
+
+  it('countAlertsSince counts posted and in-flight alerts, per team or over all teams', async () => {
+    sql.query.mockResolvedValueOnce([{ n: 4 }]).mockResolvedValueOnce([{ n: 9 }]);
+    expect(await repo.countAlertsSince('2026-10-27T10:00:00.000Z', 't-pay')).toBe(4);
+    expect(await repo.countAlertsSince('2026-11-02T10:00:00.000Z')).toBe(9);
+    const live = "(status = 'posted' OR (status = 'failed' AND reason = 'posting'))";
+    expect(queryCalls()[0]).toEqual([`SELECT COUNT(*) AS n FROM alerts WHERE target_team_id = ? AND ${live} AND created_at >= ?`, 't-pay', '2026-10-27 10:00:00']);
+    expect(queryCalls()[1]).toEqual([`SELECT COUNT(*) AS n FROM alerts WHERE ${live} AND created_at >= ?`, '2026-11-02 10:00:00']);
+  });
+
+  it('listAlertsForIncident maps rows newest first', async () => {
+    sql.query.mockResolvedValueOnce([
+      {
+        id: 'a1',
+        route_id: 'ro1',
+        incident_key: 'INC-1',
+        source: 'confluence',
+        artifact_kind: 'comment',
+        artifact_id: '900',
+        comment_id: '901',
+        artifact_url: null,
+        artifact_title: null,
+        matched_keywords: '["gateway"]',
+        target_team_id: 't-pay',
+        target_team_name: 'Arkana Payments',
+        posted_comment_id: '777',
+        status: 'posted',
+        reason: null,
+        feedback: 'useful',
+        error: null,
+        created_at: '2026-11-03 10:00:00',
+      },
+    ]);
+    const rows = await repo.listAlertsForIncident('INC-1');
+    expect(queryCalls()[0]![0]).toMatch(/WHERE incident_key = \? ORDER BY created_at DESC, id ASC LIMIT 100$/);
+    expect(rows[0]).toMatchObject({ id: 'a1', matchedKeywords: ['gateway'], postedCommentId: '777', feedback: 'useful', createdAt: '2026-11-03T10:00:00.000Z' });
+  });
+
+  it('setAlertFeedback only changes posted alerts', async () => {
+    await repo.setAlertFeedback('a1', 'not_useful');
+    expect(executeCalls()[0]).toEqual(["UPDATE alerts SET feedback = ? WHERE id = ? AND status = 'posted'", 'not_useful', 'a1']);
   });
 });
 

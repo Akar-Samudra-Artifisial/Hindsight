@@ -21,10 +21,10 @@ export interface RawContent {
   title?: string;
   space?: { key?: string };
   history?: { createdDate?: string; createdBy?: { accountId?: string; accountType?: string } };
-  version?: { when?: string; number?: number };
+  version?: { when?: string; number?: number; by?: { accountId?: string; accountType?: string } };
   body?: { storage?: { value?: string } };
   container?: { id?: string | number; title?: string; type?: string };
-  _links?: { webui?: string };
+  _links?: { webui?: string; base?: string };
 }
 
 export interface SearchPage {
@@ -90,6 +90,98 @@ interface RawPage {
   id: string | number;
   title?: string;
   _links?: { webui?: string; base?: string };
+}
+
+// --- Sentinel reads (v2) ---------------------------------------------------------------------------
+
+type Author = { accountId?: string; accountType?: string };
+
+/** A Confluence page or comment as Sentinel reads it. v2 gives author ids only; `accountType` comes from the search. */
+export interface SentinelContent {
+  type: 'page' | 'comment';
+  id: string;
+  /** The page itself, or the page the comment is on; null for a comment on a blog post or attachment. */
+  pageId: string | null;
+  pageTitle: string | null;
+  spaceKey: string | null;
+  storage: string;
+  createdBy: Author | null;
+  /** Who saved the current version. */
+  versionBy: Author | null;
+  links: { base?: string; webui?: string };
+}
+
+interface V2Page {
+  title?: string;
+  spaceId?: string | number;
+  authorId?: string;
+  version?: { authorId?: string };
+  body?: { storage?: { value?: string } };
+  _links?: { webui?: string; base?: string };
+}
+
+interface V2Comment {
+  pageId?: string | number | null;
+  version?: { authorId?: string };
+  body?: { storage?: { value?: string } };
+  _links?: { webui?: string; base?: string };
+}
+
+const ACCEPT = { headers: { Accept: 'application/json' } };
+
+const authorOf = (id: unknown): Author | null => (typeof id === 'string' && id !== '' ? { accountId: id } : null);
+
+/** v2 page as the app (`body-format=storage` only when the body is needed; `none` is refused with 400); undefined on 404. */
+async function getPageV2(id: string, withBody: boolean): Promise<V2Page | undefined> {
+  const res = withBody
+    ? await api.asApp().requestConfluence(route`/wiki/api/v2/pages/${id}?body-format=storage`, ACCEPT)
+    : await api.asApp().requestConfluence(route`/wiki/api/v2/pages/${id}`, ACCEPT);
+  if (res.status === 404) return undefined;
+  return readJson<V2Page>(res, `get page ${id}`);
+}
+
+/** Space key from a v2 space id as the app; null when the space is gone. */
+async function spaceKeyV2(spaceId: string): Promise<string | null> {
+  const res = await api.asApp().requestConfluence(route`/wiki/api/v2/spaces/${spaceId}`, ACCEPT);
+  if (res.status === 404) return null;
+  const body = await readJson<{ key?: string }>(res, `get space ${spaceId}`);
+  return typeof body.key === 'string' && body.key !== '' ? body.key : null;
+}
+
+/** Footer comment, else inline comment (v2, as the app); undefined when neither exists; `'refused'` on 401/403. */
+async function getCommentV2(id: string): Promise<V2Comment | undefined | 'refused'> {
+  for (const which of ['footer', 'inline'] as const) {
+    const res =
+      which === 'footer'
+        ? await api.asApp().requestConfluence(route`/wiki/api/v2/footer-comments/${id}?body-format=storage`, ACCEPT)
+        : await api.asApp().requestConfluence(route`/wiki/api/v2/inline-comments/${id}?body-format=storage`, ACCEPT);
+    if (res.status === 404) continue;
+    if (res.status === 401 || res.status === 403) {
+      console.warn('confluence comment: v2 refused, reading it from the search', { id, status: res.status });
+      return 'refused';
+    }
+    return readJson<V2Comment>(res, `get ${which} comment ${id}`);
+  }
+  return undefined;
+}
+
+/** A comment from the v1 CQL search (as the app), with container, space, history and body. */
+async function commentFromSearch(id: string): Promise<SentinelContent | 'not_indexed'> {
+  const page = await search('app', new URLSearchParams({ cql: `id = ${id} AND type = comment`, limit: '1', expand: SEARCH_EXPAND }));
+  const c = page.results[0];
+  if (!c) return 'not_indexed';
+  const onPage = c.container?.type === 'page' && c.container.id !== undefined;
+  return {
+    type: 'comment',
+    id,
+    pageId: onPage ? String(c.container?.id) : null,
+    pageTitle: c.container?.title ?? null,
+    spaceKey: c.space?.key ?? null,
+    storage: c.body?.storage?.value ?? '',
+    createdBy: c.history?.createdBy ?? null,
+    versionBy: c.version?.by ?? null,
+    links: { ...(page.base ? { base: page.base } : {}), ...(c._links?.webui ? { webui: c._links.webui } : {}) },
+  };
 }
 
 export const confluence = {
@@ -224,15 +316,17 @@ export const confluence = {
    * Adds a footer comment to a page. Tries v2 `footer-comments` first [VERIFY scope `write:comment:confluence`]; when
    * v2 refuses it (401/403/404) it falls back to v1 `POST /wiki/rest/api/content` type `comment`.
    */
-  async createFooterComment(pageId: string, storage: string): Promise<{ id: string; via: 'v2' | 'v1' }> {
+  async createFooterComment(pageId: string, storage: string): Promise<{ id: string; via: 'v2' | 'v1'; authorId?: string }> {
     const res = await api.asApp().requestConfluence(route`/wiki/api/v2/footer-comments`, {
       method: 'POST',
       headers: JSON_HEADERS,
       body: JSON.stringify({ pageId, body: { representation: 'storage', value: storage } }),
     });
     if (res.ok) {
-      const body = await readJson<{ id: string | number }>(res, `comment on page ${pageId}`);
-      return { id: String(body.id), via: 'v2' };
+      const body = await readJson<{ id: string | number; version?: { authorId?: string } }>(res, `comment on page ${pageId}`);
+      // The author of a comment the app wrote is the app account (Sentinel learns it, v2 reads carry no account type).
+      const authorId = body.version?.authorId;
+      return { id: String(body.id), via: 'v2', ...(typeof authorId === 'string' && authorId !== '' ? { authorId } : {}) };
     }
     if (res.status !== 401 && res.status !== 403 && res.status !== 404) throw await failure(res, `comment on page ${pageId}`);
     console.warn('confluence footer comment: v2 refused, falling back to v1', { pageId, status: res.status });
@@ -243,6 +337,76 @@ export const confluence = {
     });
     const body = await readJson<{ id: string | number }>(v1, `comment on page ${pageId} (v1)`);
     return { id: String(body.id), via: 'v1' };
+  },
+
+  // --- Sentinel ---------------------------------------------------------------------------------
+
+  /**
+   * A page or comment as Sentinel reads it, as the app. v1 `GET /wiki/rest/api/content/{id}` is gone (410), so pages
+   * come from v2 `/pages/{id}` and comments from v2 `/footer-comments/{id}` (then `/inline-comments/{id}`). v2 comment
+   * reads need `read:comment:confluence`, which the app does not hold: when v2 refuses (401/403) the comment is read
+   * from the v1 CQL search (`search:confluence`, proven in collect). Undefined when it does not exist (404);
+   * `'not_indexed'` when only the search could read it and the index does not have it yet.
+   */
+  async getSentinelContent(kind: 'page' | 'comment', id: string): Promise<SentinelContent | undefined | 'not_indexed'> {
+    if (!/^[0-9]{1,18}$/.test(id)) return undefined;
+    const spaces = new Map<string, string | null>();
+    const spaceKey = async (spaceId: unknown): Promise<string | null> => {
+      if (spaceId === undefined || spaceId === null || spaceId === '') return null;
+      const sid = String(spaceId);
+      if (!spaces.has(sid)) spaces.set(sid, await spaceKeyV2(sid));
+      return spaces.get(sid) ?? null;
+    };
+    if (kind === 'page') {
+      const page = await getPageV2(id, true);
+      if (!page) return undefined;
+      return {
+        type: 'page',
+        id,
+        pageId: id,
+        pageTitle: page.title ?? null,
+        spaceKey: await spaceKey(page.spaceId),
+        storage: page.body?.storage?.value ?? '',
+        createdBy: authorOf(page.authorId),
+        versionBy: authorOf(page.version?.authorId),
+        links: page._links ?? {},
+      };
+    }
+    const comment = await getCommentV2(id);
+    if (comment === 'refused') return commentFromSearch(id);
+    if (!comment) return undefined;
+    const pageId = comment.pageId !== undefined && comment.pageId !== null && comment.pageId !== '' ? String(comment.pageId) : null;
+    const page = pageId ? await getPageV2(pageId, false) : undefined;
+    // v2 comments carry no creator; the version author is the creator of version 1 and the last editor after that.
+    const by = authorOf(comment.version?.authorId);
+    return {
+      type: 'comment',
+      id,
+      pageId,
+      pageTitle: page?.title ?? null,
+      spaceKey: page ? await spaceKey(page.spaceId) : null,
+      storage: comment.body?.storage?.value ?? '',
+      createdBy: by,
+      versionBy: by,
+      links: comment._links ?? {},
+    };
+  },
+
+  /** Adds a footer comment as the current user (v2). Resolvers only. */
+  async createFooterCommentAsUser(pageId: string, storage: string): Promise<{ id: string }> {
+    const res = await api.asUser().requestConfluence(route`/wiki/api/v2/footer-comments`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ pageId, body: { representation: 'storage', value: storage } }),
+    });
+    const body = await readJson<{ id: string | number }>(res, `comment on page ${pageId} as user`);
+    return { id: String(body.id) };
+  },
+
+  /** Deletes a page or comment (v1) as the app; a missing one counts as deleted. */
+  async deleteContentV1(id: string): Promise<void> {
+    const res = await api.asApp().requestConfluence(route`/wiki/rest/api/content/${id}`, { method: 'DELETE', headers: { Accept: 'application/json' } });
+    if (!res.ok && res.status !== 404) throw await failure(res, `delete content ${id}`);
   },
 
   /** Moves the page to the trash, then purges it. A missing page counts as deleted; a failed purge is only logged. */

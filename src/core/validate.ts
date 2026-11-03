@@ -33,6 +33,35 @@ export function parseRouteId(value: unknown): string {
   return id.toLowerCase();
 }
 
+/** Sentinel alert id from the Routes tab. */
+export function parseAlertId(value: unknown): string {
+  const id = typeof value === 'string' ? value.trim() : '';
+  if (!SIGNAL_ID.test(id)) throw new InputError('alertId must be an alert id shown on the Routes tab.');
+  return id.toLowerCase();
+}
+
+/** `useful` or `not_useful`. */
+export function parseAlertFeedback(value: unknown): 'useful' | 'not_useful' {
+  if (value === 'useful' || value === 'not_useful') return value;
+  throw new InputError('feedback must be useful or not_useful.');
+}
+
+/** Target of a route decision from the panel: `active` (approve or resume) or `paused`; absent means `active`. */
+export function parseRouteTarget(value: unknown): 'active' | 'paused' {
+  if (value === undefined || value === null || value === '' || value === 'active') return 'active';
+  if (value === 'paused') return 'paused';
+  throw new InputError('status must be active or paused.');
+}
+
+/** Sentinel weekly cap per team from the setup page: a whole number in [1, max]. */
+export function parseWeeklyCapInput(value: unknown, max: number): number {
+  const text = typeof value === 'number' ? String(value) : typeof value === 'string' ? value.trim() : '';
+  if (!/^[0-9]+$/.test(text)) throw new InputError('The weekly cap must be a whole number.');
+  const n = Number(text);
+  if (n < 1 || n > max) throw new InputError(`The weekly cap must be between 1 and ${max}.`);
+  return n;
+}
+
 /** Optional signal id: absent or empty → undefined. */
 export function parseOptionalSignalId(value: unknown): string | undefined {
   if (value === undefined || value === null || (typeof value === 'string' && value.trim() === '')) return undefined;

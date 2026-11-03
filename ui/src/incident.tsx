@@ -4,7 +4,7 @@ import { mount } from './mount';
 import { ReachMap } from './ReachMap';
 import { RoutesList } from './RoutesList';
 import { SignalCard, type Decision, type SignalView } from './SignalCard';
-import { stopCopy, type ReachView } from './reach';
+import { stopCopy, type AlertsByRoute, type ReachView } from './reach';
 
 /** Incident panel: Analyze, job status + funnel, and the scored early signals with Confirm / Reject / Undo. */
 
@@ -132,6 +132,8 @@ function App() {
   const [tab, setTab] = useState<Tab>('signals');
   const [tracing, setTracing] = useState(false);
   const [approving, setApproving] = useState<string | null>(null);
+  const [alerts, setAlerts] = useState<AlertsByRoute>({});
+  const [routeNote, setRouteNote] = useState<{ routeId: string; text: string } | null>(null);
 
   const load = useCallback(() => {
     invoke('getAnalysis', {})
@@ -189,13 +191,41 @@ function App() {
       .finally(() => setTracing(false));
   };
 
-  const approve = (routeId: string) => {
+  const loadAlerts = useCallback(() => {
+    invoke('getSentinelAlerts', {})
+      .then((r) => {
+        const res = r as { byRoute?: AlertsByRoute; error?: string };
+        if (res.error) setError(res.error);
+        else if (res.byRoute) setAlerts(res.byRoute);
+      })
+      .catch((e: unknown) => setError(errorText(e)));
+  }, []);
+
+  useEffect(() => {
+    if (tab === 'routes') loadAlerts();
+  }, [tab, loadAlerts]);
+
+  const decideRoute = (routeId: string, status: 'active' | 'paused') => {
     setApproving(routeId);
-    invoke('decideRoute', { routeId })
+    setRouteNote(null);
+    invoke('decideRoute', { routeId, status })
+      .then((r) => {
+        const res = r as { error?: string };
+        if (res.error) setRouteNote({ routeId, text: res.error });
+        load();
+        loadAlerts();
+      })
+      .catch((e: unknown) => setError(errorText(e)))
+      .finally(() => setApproving(null));
+  };
+
+  const feedback = (alertId: string, value: 'useful' | 'not_useful') => {
+    setApproving(alertId);
+    invoke('alertFeedback', { alertId, feedback: value })
       .then((r) => {
         const res = r as { error?: string };
         if (res.error) setError(res.error);
-        load();
+        loadAlerts();
       })
       .catch((e: unknown) => setError(errorText(e)))
       .finally(() => setApproving(null));
@@ -324,7 +354,12 @@ function App() {
               ))}
             {tab === 'routes' &&
               (analysis.reach.routes.length > 0 ? (
-                <RoutesList routes={analysis.reach.routes} responder={analysis.reach.responderTeamName ?? 'the responder team'} busy={approving} onApprove={approve} />
+                <RoutesList routes={analysis.reach.routes} responder={analysis.reach.responderTeamName ?? 'the responder team'}                   alerts={alerts}
+                  note={routeNote}
+                  busy={approving}
+                  onDecide={decideRoute}
+                  onFeedback={feedback}
+                />
               ) : (
                 <p style={s.muted}>{ROUTES_NOTE[analysis.reach.routesNote ?? 'no_graph']}</p>
               ))}

@@ -24,16 +24,27 @@ const repoMock = vi.hoisted(() => ({
   listRoutes: vi.fn(async () => []),
   getScoreCache: vi.fn(async (): Promise<Map<string, unknown>> => new Map()),
   putScoreCache: vi.fn(async (_rows: unknown[]) => 0),
+  listActiveRoutes: vi.fn(),
+  insertAlert: vi.fn(),
+  updateAlert: vi.fn(),
+  listAlertsForArtifact: vi.fn(),
+  countAlertsSince: vi.fn(),
+  listServiceMappings: vi.fn(),
 }));
 const llm = vi.hoisted(() => ({ pickModels: vi.fn(), chatTool: vi.fn() }));
 vi.mock('@forge/llm', () => ({ chat: vi.fn(), list: vi.fn() }));
 vi.mock('../src/llm', async (importOriginal) => ({ ...(await importOriginal<typeof import('../src/llm')>()), ...llm }));
 const tw = vi.hoisted(() => ({ writeDossier: vi.fn() }));
-const jiraMock = vi.hoisted(() => ({ getIssueSelf: vi.fn() }));
+const jiraMock = vi.hoisted(() => ({ getIssueSelf: vi.fn(), getIssueForSentinel: vi.fn(), getComment: vi.fn(), addComment: vi.fn(), siteUrl: vi.fn() }));
+const confluenceMock = vi.hoisted(() => ({ getSentinelContent: vi.fn(), createFooterComment: vi.fn() }));
 vi.mock('../src/adapters/teamworkGraph', () => tw);
 vi.mock('../src/adapters/jira', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/adapters/jira')>();
   return { ...actual, jira: { ...actual.jira, ...jiraMock } };
+});
+vi.mock('../src/adapters/confluence', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/adapters/confluence')>();
+  return { ...actual, confluence: { ...actual.confluence, ...confluenceMock } };
 });
 const queue = vi.hoisted(() => ({ push: vi.fn() }));
 const collect = vi.hoisted(() => ({ runCollectStep: vi.fn() }));
@@ -54,9 +65,10 @@ vi.mock('@forge/events', async (importOriginal) => {
 });
 vi.mock('../src/core/collect', async (importOriginal) => ({ ...(await importOriginal<typeof import('../src/core/collect')>()), ...collect }));
 
-const { collectEvents, demoJob, migrateSchema, onAppLifecycle, onConnectionChange, retryLater, SCHEMA_RETRY_SECONDS, scoreCandidates } = await import(
-  '../src/surfaces/background'
-);
+const { checkSentinel, collectEvents, demoJob, migrateSchema, onAppLifecycle, onConnectionChange, onWorkEvent, retryLater, SCHEMA_RETRY_SECONDS, scoreCandidates } =
+  await import('../src/surfaces/background');
+const { JiraError } = await import('../src/adapters/jira');
+const { ConfluenceError } = await import('../src/adapters/confluence');
 
 const created = {
   action: 'CREATED',
@@ -476,5 +488,308 @@ describe('demoJob consumer', () => {
 
   it('rejects a body without a valid job id', async () => {
     await expect(demoJob({ body: { jobId: 'x' } })).rejects.toThrow('jobId');
+  });
+});
+
+describe('Sentinel', () => {
+  const ROUTE = {
+    id: 'ro1',
+    originIncidentKey: 'INC-60',
+    sourceType: 'confluence_space',
+    sourceKey: 'PLAT',
+    spec: { keywords: ['gateway'], target: { teamId: 't-pay', action: 'mention' } },
+    status: 'active',
+  };
+  const commentEvent = { eventType: 'avi:confluence:created:comment', atlassianId: 'acc-human', content: { id: '901', space: { key: 'PLAT' } } };
+  const commentBody = { v: 1, source: 'confluence', kind: 'comment', artifactId: '', commentId: '901', eventType: 'avi:confluence:created:comment', attempt: 1 };
+  // `SentinelContent` (the adapter's v2 / search mapping is tested in confluence.test.ts).
+  const content = (over: Record<string, unknown> = {}) => ({
+    type: 'comment',
+    id: '901',
+    pageId: '900',
+    pageTitle: 'Build pipeline conventions',
+    spaceKey: 'PLAT',
+    storage: '<p>Provider notice #1: gateway change</p>',
+    createdBy: { accountId: 'acc-human', accountType: 'atlassian' },
+    versionBy: { accountId: 'acc-human', accountType: 'atlassian' },
+    links: { base: 'https://one.atlassian.net/wiki', webui: '/spaces/PLAT/pages/900?focusedCommentId=901' },
+    ...over,
+  });
+
+  beforeEach(() => {
+    repoMock.listActiveRoutes.mockReset().mockResolvedValue([ROUTE]);
+    repoMock.insertAlert.mockReset().mockResolvedValue('alert-1');
+    repoMock.updateAlert.mockReset().mockResolvedValue(1);
+    repoMock.listAlertsForArtifact.mockReset().mockResolvedValue([]);
+    // Counted after the run's own row is inserted, so 1 = only this alert.
+    repoMock.countAlertsSince.mockReset().mockResolvedValue(1);
+    repoMock.listServiceMappings.mockReset().mockResolvedValue([{ serviceKey: 'checkout', ownerTeamId: 't-pay', ownerTeamName: 'Arkana Payments', aliases: [] }]);
+    repoMock.getIncident.mockReset().mockResolvedValue(undefined);
+    jiraMock.siteUrl.mockReset().mockResolvedValue('https://one.atlassian.net');
+    jiraMock.getIssueForSentinel.mockReset();
+    jiraMock.getComment.mockReset();
+    jiraMock.addComment.mockReset().mockResolvedValue({ id: '555' });
+    confluenceMock.getSentinelContent.mockReset().mockResolvedValue(content());
+    confluenceMock.createFooterComment.mockReset().mockResolvedValue({ id: '777', via: 'v2' });
+  });
+
+  describe('onWorkEvent', () => {
+    it('queues an event an active route could cover, without text or account ids', async () => {
+      await onWorkEvent(commentEvent);
+      expect(console.info).toHaveBeenCalledWith('on-work-event received', { eventType: 'avi:confluence:created:comment' });
+      expect(queue.push).toHaveBeenCalledWith('sentinel', { body: commentBody });
+      expect(console.info).toHaveBeenCalledWith('sentinel queued', expect.objectContaining({ source: 'confluence', kind: 'comment' }));
+      expect(JSON.stringify(queue.push.mock.calls)).not.toContain('acc-human');
+    });
+
+    it('skips self-generated events and events by a known app account', async () => {
+      await onWorkEvent({ ...commentEvent, selfGenerated: true });
+      repoMock.getSetting.mockResolvedValue(['acc-human']);
+      await onWorkEvent(commentEvent);
+      expect(queue.push).not.toHaveBeenCalled();
+      expect(vi.mocked(console.info).mock.calls.filter((c) => c[0] === 'sentinel skipped' && (c[1] as { reason: string }).reason === 'self')).toHaveLength(2);
+    });
+
+    it('skips without an active route, or when no route covers the space', async () => {
+      repoMock.listActiveRoutes.mockResolvedValueOnce([]);
+      await onWorkEvent(commentEvent);
+      expect(console.info).toHaveBeenCalledWith('sentinel skipped', expect.objectContaining({ reason: 'no_active_route' }));
+      await onWorkEvent({ ...commentEvent, content: { id: '901', space: { key: 'OPS' } } });
+      expect(console.info).toHaveBeenCalledWith('sentinel skipped', expect.objectContaining({ reason: 'source_mismatch' }));
+      expect(queue.push).not.toHaveBeenCalled();
+    });
+
+    it('never throws: unsupported events and schema errors are skipped', async () => {
+      await onWorkEvent({ eventType: 'avi:jira:deleted:issue' });
+      sql.ensureSchema.mockRejectedValueOnce(new SchemaSettingUpError(15, 16));
+      await onWorkEvent(commentEvent);
+      expect(queue.push).not.toHaveBeenCalled();
+      expect(console.info).toHaveBeenCalledWith('sentinel skipped', expect.objectContaining({ reason: 'schema_not_ready' }));
+    });
+  });
+
+  describe('checkSentinel', () => {
+    it('matches, records the alert and posts one footer comment on the page, under a lock', async () => {
+      expect(await checkSentinel({ body: commentBody })).toBeUndefined();
+      expect(repoMock.acquireAppLock).toHaveBeenCalledWith('sentinel:confluence.0.901', expect.any(String), 300);
+      expect(console.info).toHaveBeenCalledWith('sentinel matched', { routeId: 'ro1', artifact: 'confluence:comment:900/901' });
+      expect(repoMock.insertAlert).toHaveBeenCalledWith(
+        expect.objectContaining({ routeId: 'ro1', incidentKey: 'INC-60', artifactId: '900', commentId: '901', matchedKeywords: ['gateway'], targetTeamName: 'Arkana Payments', status: 'failed', reason: 'posting' }),
+      );
+      const [pageId, storage] = confluenceMock.createFooterComment.mock.calls[0]!;
+      expect(pageId).toBe('900');
+      expect(storage).toContain('[Hindsight Sentinel]');
+      expect(storage).toContain('<strong>Arkana Payments</strong>');
+      expect(storage).toContain('https://one.atlassian.net/browse/INC-60');
+      // Neutral comment: the matched keyword and the route source are not repeated.
+      expect(storage).not.toMatch(/gateway|PLAT|keyword/i);
+      expect(repoMock.updateAlert).toHaveBeenCalledWith('alert-1', { status: 'posted', reason: null, postedCommentId: '777', error: null });
+      expect(console.info).toHaveBeenCalledWith('alert posted', { alertId: 'alert-1', commentId: '777' });
+      expect(repoMock.releaseAppLock).toHaveBeenCalledWith('sentinel:confluence.0.901');
+    });
+
+    it('skips an app-written artifact (and learns the app account) or a marked one whose account type is unknown (v2)', async () => {
+      confluenceMock.getSentinelContent.mockResolvedValueOnce(content({ createdBy: { accountId: 'app-9', accountType: 'app' } }));
+      await checkSentinel({ body: commentBody });
+      expect(repoMock.setSetting).toHaveBeenCalledWith('app_account_ids', ['app-9']);
+      confluenceMock.getSentinelContent.mockResolvedValueOnce(content({ createdBy: { accountId: 'app-x' }, storage: '<p><strong>[Hindsight Sentinel]</strong> gateway</p>' }));
+      await checkSentinel({ body: commentBody });
+      expect(confluenceMock.createFooterComment).not.toHaveBeenCalled();
+      expect(vi.mocked(console.info).mock.calls.filter((c) => c[0] === 'sentinel skipped' && (c[1] as { reason: string }).reason === 'self')).toHaveLength(2);
+    });
+
+    it('a person typing the Sentinel marker is still alerted (marker spoof does not suppress)', async () => {
+      confluenceMock.getSentinelContent.mockResolvedValueOnce(content({ storage: '<p>[Hindsight Sentinel] gateway change</p>' }));
+      await checkSentinel({ body: commentBody });
+      expect(confluenceMock.createFooterComment).toHaveBeenCalledTimes(1);
+    });
+
+    it('skips when no active route is left, or nothing matches', async () => {
+      repoMock.listActiveRoutes.mockResolvedValueOnce([]);
+      await checkSentinel({ body: commentBody });
+      expect(console.info).toHaveBeenCalledWith('sentinel skipped', expect.objectContaining({ reason: 'no_active_route' }));
+      confluenceMock.getSentinelContent.mockResolvedValueOnce(content({ storage: '<p>Lunch menu</p>' }));
+      await checkSentinel({ body: commentBody });
+      expect(console.info).toHaveBeenCalledWith('sentinel skipped', expect.objectContaining({ reason: 'no_match' }));
+      expect(repoMock.insertAlert).not.toHaveBeenCalled();
+    });
+
+    const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+
+    it('dedup: a posted alert for the same route and artifact, however old → no new alert and no new row', async () => {
+      repoMock.listAlertsForArtifact.mockResolvedValueOnce([{ status: 'posted', reason: null, createdAt: ago(60 * 24 * 40) }]);
+      await checkSentinel({ body: commentBody });
+      expect(repoMock.listAlertsForArtifact).toHaveBeenCalledWith('ro1', '900', '901');
+      expect(console.info).toHaveBeenCalledWith('sentinel skipped', expect.objectContaining({ reason: 'dedup' }));
+      expect(repoMock.insertAlert).not.toHaveBeenCalled();
+      expect(confluenceMock.createFooterComment).not.toHaveBeenCalled();
+    });
+
+    it('updated:page re-fires for the same page never re-alert (lifetime dedup per route and page)', async () => {
+      const pageBody = { v: 1, source: 'confluence', kind: 'page', artifactId: '900', commentId: '', eventType: 'avi:confluence:updated:page', attempt: 1 };
+      confluenceMock.getSentinelContent.mockResolvedValue(
+        content({ id: '900', type: 'page', pageId: '900', pageTitle: 'Gateway notes', versionBy: { accountId: 'acc-human' }, links: {} }),
+      );
+      await checkSentinel({ body: pageBody });
+      expect(confluenceMock.createFooterComment).toHaveBeenCalledTimes(1);
+      repoMock.listAlertsForArtifact.mockResolvedValue([{ status: 'posted', reason: null, createdAt: ago(60 * 25) }]);
+      await checkSentinel({ body: pageBody });
+      expect(repoMock.listAlertsForArtifact).toHaveBeenLastCalledWith('ro1', '900', '');
+      expect(confluenceMock.createFooterComment).toHaveBeenCalledTimes(1);
+      expect(repoMock.insertAlert).toHaveBeenCalledTimes(1);
+    });
+
+    it('a crash after posting (row left failed/posting) never leads to a second post', async () => {
+      repoMock.listAlertsForArtifact.mockResolvedValueOnce([{ status: 'failed', reason: 'posting', createdAt: ago(5) }]);
+      await checkSentinel({ body: commentBody });
+      expect(console.info).toHaveBeenCalledWith('sentinel skipped', expect.objectContaining({ reason: 'in_flight' }));
+      expect(repoMock.insertAlert).not.toHaveBeenCalled();
+      expect(confluenceMock.createFooterComment).not.toHaveBeenCalled();
+    });
+
+    it('repeated failures back off (1 h) and stop after 3, without new rows', async () => {
+      repoMock.listAlertsForArtifact.mockResolvedValueOnce([{ status: 'failed', reason: 'api_error', createdAt: ago(10) }]);
+      await checkSentinel({ body: commentBody });
+      expect(console.info).toHaveBeenCalledWith('sentinel skipped', expect.objectContaining({ reason: 'backoff' }));
+      repoMock.listAlertsForArtifact.mockResolvedValueOnce([
+        { status: 'failed', reason: 'api_error', createdAt: ago(300) },
+        { status: 'failed', reason: 'api_error', createdAt: ago(200) },
+        { status: 'failed', reason: 'rate_limited', createdAt: ago(100) },
+      ]);
+      await checkSentinel({ body: commentBody });
+      expect(console.info).toHaveBeenCalledWith('sentinel skipped', expect.objectContaining({ reason: 'gave_up' }));
+      expect(repoMock.insertAlert).not.toHaveBeenCalled();
+      expect(confluenceMock.createFooterComment).not.toHaveBeenCalled();
+    });
+
+    it('weekly cap: the row is inserted first, then the cap is recounted; over the cap → skipped, nothing posted', async () => {
+      repoMock.countAlertsSince.mockResolvedValueOnce(51);
+      await checkSentinel({ body: commentBody });
+      expect(repoMock.insertAlert).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed', reason: 'posting' }));
+      expect(repoMock.countAlertsSince).toHaveBeenCalledWith(expect.any(String), 't-pay');
+      expect(repoMock.updateAlert).toHaveBeenCalledWith('alert-1', { status: 'skipped', reason: 'weekly_cap' });
+      expect(confluenceMock.createFooterComment).not.toHaveBeenCalled();
+      // At the cap (own row included) is still allowed; the setting overrides the default.
+      repoMock.getSetting.mockImplementation(async (k: string) => (k === 'sentinel_weekly_cap' ? 60 : undefined));
+      repoMock.countAlertsSince.mockResolvedValueOnce(60).mockResolvedValueOnce(1);
+      await checkSentinel({ body: commentBody });
+      expect(confluenceMock.createFooterComment).toHaveBeenCalledTimes(1);
+    });
+
+    it('daily cap over all teams (default 200, setting sentinel_daily_cap)', async () => {
+      repoMock.countAlertsSince.mockImplementation(async (_since: string, teamId?: string) => (teamId ? 1 : 201));
+      await checkSentinel({ body: commentBody });
+      expect(repoMock.updateAlert).toHaveBeenCalledWith('alert-1', { status: 'skipped', reason: 'daily_cap' });
+      expect(console.info).toHaveBeenCalledWith('sentinel skipped', expect.objectContaining({ reason: 'daily_cap', cap: 200 }));
+      expect(confluenceMock.createFooterComment).not.toHaveBeenCalled();
+      repoMock.getSetting.mockImplementation(async (k: string) => (k === 'sentinel_daily_cap' ? 500 : undefined));
+      await checkSentinel({ body: commentBody });
+      expect(confluenceMock.createFooterComment).toHaveBeenCalledTimes(1);
+    });
+
+    it('one comment per team even when two routes match', async () => {
+      repoMock.listActiveRoutes.mockResolvedValue([ROUTE, { ...ROUTE, id: 'ro2' }]);
+      await checkSentinel({ body: commentBody });
+      expect(confluenceMock.createFooterComment).toHaveBeenCalledTimes(1);
+      expect(console.info).toHaveBeenCalledWith('sentinel skipped', expect.objectContaining({ reason: 'team_already_alerted', routeId: 'ro2' }));
+    });
+
+    it('on 429 marks the alert rate limited and re-queues after 60 s with attempt + 1, at most 3 attempts', async () => {
+      confluenceMock.createFooterComment.mockRejectedValue(new ConfluenceError(429, 'Confluence comment 429: slow down'));
+      await checkSentinel({ body: commentBody });
+      expect(repoMock.updateAlert).toHaveBeenCalledWith('alert-1', expect.objectContaining({ status: 'failed', reason: 'rate_limited' }));
+      expect(queue.push).toHaveBeenCalledWith('sentinel', { body: { ...commentBody, attempt: 2 }, delayInSeconds: 60 });
+      queue.push.mockClear();
+      await checkSentinel({ body: { ...commentBody, attempt: 3 } });
+      expect(queue.push).not.toHaveBeenCalled();
+      expect(console.warn).toHaveBeenCalledWith('sentinel: rate limited, gave up', { attempt: 3 });
+    });
+
+    it('a 403 marks the alert failed (api_error) without a retry', async () => {
+      confluenceMock.createFooterComment.mockRejectedValue(new ConfluenceError(403, 'Confluence comment 403: forbidden'));
+      expect(await checkSentinel({ body: commentBody })).toBeUndefined();
+      expect(repoMock.updateAlert).toHaveBeenCalledWith('alert-1', { status: 'failed', reason: 'api_error', error: 'Confluence comment 403: forbidden' });
+      expect(queue.push).not.toHaveBeenCalled();
+    });
+
+    it('a permanent read failure (410 removed endpoint, 404) is skipped with a reason, never re-queued', async () => {
+      confluenceMock.getSentinelContent.mockRejectedValueOnce(new ConfluenceError(410, 'Confluence get content 5472298 410: This deprecated endpoint has been removed.'));
+      expect(await checkSentinel({ body: commentBody })).toBeUndefined();
+      expect(console.info).toHaveBeenCalledWith('sentinel skipped', expect.objectContaining({ reason: 'read_failed_410' }));
+      expect(console.error).not.toHaveBeenCalledWith('sentinel failed', expect.anything());
+      confluenceMock.getSentinelContent.mockResolvedValueOnce(undefined);
+      await checkSentinel({ body: commentBody });
+      expect(console.info).toHaveBeenCalledWith('sentinel skipped', expect.objectContaining({ reason: 'not_found' }));
+      expect(queue.push).not.toHaveBeenCalled();
+      expect(repoMock.insertAlert).not.toHaveBeenCalled();
+    });
+
+    it('a comment the search index does not have yet is re-queued after 60 s, at most 3 attempts', async () => {
+      confluenceMock.getSentinelContent.mockResolvedValue('not_indexed');
+      await checkSentinel({ body: commentBody });
+      expect(queue.push).toHaveBeenCalledWith('sentinel', { body: { ...commentBody, attempt: 2 }, delayInSeconds: 60 });
+      queue.push.mockClear();
+      await checkSentinel({ body: { ...commentBody, attempt: 3 } });
+      expect(queue.push).not.toHaveBeenCalled();
+      expect(console.warn).toHaveBeenCalledWith('sentinel: not indexed yet, gave up', { attempt: 3 });
+    });
+
+    it('a comment on a blog post (no page) is skipped; the v2 author of a posted comment is learned as an app account', async () => {
+      confluenceMock.getSentinelContent.mockResolvedValueOnce(content({ pageId: null }));
+      await checkSentinel({ body: commentBody });
+      expect(console.info).toHaveBeenCalledWith('sentinel skipped', expect.objectContaining({ reason: 'not_on_page' }));
+      confluenceMock.createFooterComment.mockResolvedValueOnce({ id: '778', via: 'v2', authorId: 'app-hs' });
+      await checkSentinel({ body: commentBody });
+      expect(repoMock.setSetting).toHaveBeenCalledWith('app_account_ids', ['app-hs']);
+    });
+
+    it('builds the comment link from the site URL when v2 gives no base', async () => {
+      confluenceMock.getSentinelContent.mockResolvedValueOnce(content({ links: { webui: '/spaces/PLAT/pages/900?focusedCommentId=901' } }));
+      await checkSentinel({ body: commentBody });
+      expect(repoMock.insertAlert).toHaveBeenCalledWith(expect.objectContaining({ artifactUrl: 'https://one.atlassian.net/wiki/spaces/PLAT/pages/900?focusedCommentId=901' }));
+    });
+
+    it('Jira comment: posts on the issue (ADF); a restricted comment is skipped', async () => {
+      const body = { v: 1, source: 'jira', kind: 'comment', artifactId: '10001', commentId: '200', eventType: 'avi:jira:commented:issue', attempt: 1 };
+      repoMock.listActiveRoutes.mockResolvedValue([{ ...ROUTE, sourceType: 'jira_project', sourceKey: 'PAY' }]);
+      jiraMock.getIssueForSentinel.mockResolvedValue({ id: '10001', key: 'PAY-7', fields: { summary: 'Release notes', project: { key: 'PAY' } } });
+      jiraMock.getComment.mockResolvedValueOnce({ id: '200', author: { accountId: 'u', accountType: 'atlassian' }, body: { type: 'doc', version: 1, content: [{ type: 'paragraph', content: [{ type: 'text', text: 'gateway timeout' }] }] } });
+      await checkSentinel({ body });
+      expect(jiraMock.addComment).toHaveBeenCalledWith('10001', expect.objectContaining({ type: 'doc' }), { internal: false });
+      expect(repoMock.insertAlert).toHaveBeenCalledWith(expect.objectContaining({ artifactUrl: 'https://one.atlassian.net/browse/PAY-7?focusedCommentId=200', artifactTitle: 'Release notes' }));
+      jiraMock.addComment.mockClear();
+      jiraMock.getComment.mockResolvedValueOnce({ id: '200', visibility: { type: 'role', value: 'Developers' }, body: 'gateway' });
+      await checkSentinel({ body });
+      expect(jiraMock.addComment).not.toHaveBeenCalled();
+      expect(console.info).toHaveBeenCalledWith('sentinel skipped', expect.objectContaining({ reason: 'restricted' }));
+    });
+
+    it('on a JSM (service_desk) issue the alert is an internal note', async () => {
+      const body = { v: 1, source: 'jira', kind: 'issue', artifactId: '10002', commentId: '', eventType: 'avi:jira:created:issue', attempt: 1 };
+      repoMock.listActiveRoutes.mockResolvedValue([{ ...ROUTE, sourceType: 'jira_project', sourceKey: 'INC' }]);
+      jiraMock.getIssueForSentinel.mockResolvedValue({
+        id: '10002',
+        key: 'INC-70',
+        fields: { summary: 'Gateway errors at checkout', project: { key: 'INC', projectTypeKey: 'service_desk' }, creator: { accountId: 'cust', accountType: 'customer' } },
+      });
+      await checkSentinel({ body });
+      expect(jiraMock.addComment).toHaveBeenCalledWith('10002', expect.objectContaining({ type: 'doc' }), { internal: true });
+    });
+
+    it('a 429 while reading the artifact re-queues too; an invalid body is ignored', async () => {
+      const body = { v: 1, source: 'jira', kind: 'issue', artifactId: '10001', commentId: '', eventType: 'avi:jira:created:issue', attempt: 1 };
+      jiraMock.getIssueForSentinel.mockRejectedValueOnce(new JiraError(429, 'Jira 429: slow down'));
+      await checkSentinel({ body });
+      expect(queue.push).toHaveBeenCalledWith('sentinel', { body: { ...body, attempt: 2 }, delayInSeconds: 60 });
+      expect(await checkSentinel({ body: { v: 1, source: 'jira' } })).toBeUndefined();
+      expect(console.warn).toHaveBeenCalledWith('sentinel: invalid event ignored', expect.anything());
+    });
+
+    it('asks for a retry with retryData while the schema or the lock is busy', async () => {
+      sql.ensureSchema.mockRejectedValueOnce(new SchemaSettingUpError(15, 16));
+      expect(await checkSentinel({ body: commentBody })).toMatchObject({ retryOptions: { retryData: { reason: 'schema' } } });
+      repoMock.acquireAppLock.mockResolvedValueOnce(false);
+      expect(await checkSentinel({ body: commentBody })).toMatchObject({ retryOptions: { retryData: { reason: 'locked' } } });
+    });
   });
 });
