@@ -6,6 +6,11 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), dan p
 
 ## [Unreleased]
 
+### Changed
+
+- `docs/PRIVACY.md` dan `docs/TERMS.md`: pihak penyedia disamakan menjadi Bayu Trisnapati (vendor Marketplace perorangan; kode dipublikasikan di GitHub Akar Samudra Artifisial), ditambah portal dukungan; substansi kebijakan data tidak berubah.
+- `README.md` dilengkapi untuk customer dan reviewer Marketplace: instalasi dari listing, alur pemakaian, bagian Data and privacy (Runs on Atlassian, Forge SQL, Forge LLM), dan Support (portal + email).
+
 ### Added
 
 - Kebijakan privasi `docs/PRIVACY.md` untuk listing Marketplace dan Developer Console.
