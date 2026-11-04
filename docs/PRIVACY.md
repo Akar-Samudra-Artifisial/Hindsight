@@ -1,8 +1,8 @@
 # Hindsight Privacy Policy
 
-Last updated: 3 November 2026
+Last updated: 4 November 2026
 
-Hindsight is an Atlassian Forge app for Jira (including Jira Service Management) and Confluence, built by Akar Samudra Artifisial as an entry to Atlassian Codegeist 2026. For a past incident, it looks back at the work items, comments and pages created before the incident, finds early signals that already pointed to the problem, and shows where those signals stopped travelling. Routes approved by people then watch for similar signals and alert the right team in the future.
+Hindsight is an Atlassian Forge app for Jira (including Jira Service Management) and Confluence, provided by Bayu Trisnapati (individual Marketplace vendor, publishing the source as part of Akar Samudra Artifisial on GitHub) as an entry to Atlassian Codegeist 2026. For a past incident, it looks back at the work items, comments and pages created before the incident, finds early signals that already pointed to the problem, and shows where those signals stopped travelling. Routes approved by people then watch for similar signals and alert the right team in the future.
 
 This policy explains what data the app reads, stores and writes, and who can see it.
 
@@ -90,4 +90,7 @@ Updates to this policy are published in this file in the public repository, with
 
 ## Contact
 
-Questions: bayutrisnapati@gmail.com
+Hindsight is provided by Bayu Trisnapati.
+
+- Email: bayutrisnapati@gmail.com
+- Support portal: https://bayutrisnapati.atlassian.net/servicedesk/customer/portals

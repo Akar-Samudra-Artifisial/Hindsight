@@ -32,7 +32,7 @@ Built for Atlassian Codegeist 2026 (Apps for Software Teams). Runs on Atlassian:
 
 <!-- INSTALL_LINK: paste the same Developer Console installation link used on Devpost -->
 
-The installation link is listed in the Codegeist 2026 submission on Devpost. Open it, install Hindsight on **Jira**, then on **Confluence** on the same site.
+Install Hindsight from its Atlassian Marketplace listing, or use the installation link listed in the Codegeist 2026 submission on Devpost. Install it on **Jira** first, then on **Confluence** on the same site (this order also avoids the MCP `-32014` error described below). An organization admin approves the requested scopes during install.
 
 ## Setup
 
@@ -43,6 +43,14 @@ Open **Jira → Apps → Hindsight setup** (Jira administrators only).
 3. Optional: set the weekly Sentinel alert cap per team.
 
 Without an owner team id, the reach map shows "Graph context not available" instead of 0.
+
+## Use Hindsight on your incidents
+
+1. Open a past incident in a mapped project and open the **Hindsight** issue panel.
+2. Click **Analyze** (once). Review each proposed signal and **Confirm** or **Reject** it; AI output is a proposal, not a verdict.
+3. Click **Trace reach** to see whether the confirmed signals reached the owner team before the incident and where they stopped.
+4. Open **Routes**, **Approve** the routes you want to keep watching. Sentinel then posts a team-level heads-up when a matching artifact appears; give **Useful / Not useful** feedback on alerts.
+5. Optionally ask the **Hindsight Investigator** in Rovo, or call the MCP tools, for the same results.
 
 ## Load demo data
 
@@ -119,10 +127,21 @@ npm run lint       # forge lint (needs a registered app id in manifest.yml)
 npm run deploy     # build the UI and forge deploy
 ```
 
-## Privacy and terms
+## Data and privacy
 
-- [Privacy Policy](docs/PRIVACY.md)
-- [Terms of Service](docs/TERMS.md)
+- **Runs on Atlassian.** Hindsight runs entirely on Atlassian Forge: no egress, no remote backend, no third-party services. The developer has no access to your site's data.
+- **Forge SQL.** Analysis results, routes, alerts and settings are stored in Atlassian-hosted Forge SQL, separate per installation. Hindsight stores references and short excerpts (candidate excerpts of at most 2,000 characters, signal quotes of at most 300), not full copies of your content, and no names or email addresses.
+- **Forge LLM.** Candidate signals are scored by Claude models hosted by Atlassian through Forge LLM. Content does not leave Atlassian.
+- **Permission checks.** Quotes, titles and links are shown only to users who can open the source artifact; MCP tools and Rovo actions apply the same checks.
+
+Details: [Privacy Policy](docs/PRIVACY.md) · [Terms of Service](docs/TERMS.md)
+
+## Support
+
+Hindsight is provided by Bayu Trisnapati.
+
+- Support portal: https://bayutrisnapati.atlassian.net/servicedesk/customer/portals
+- Email: bayutrisnapati@gmail.com
 
 ## License
 
