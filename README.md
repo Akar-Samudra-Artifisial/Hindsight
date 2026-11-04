@@ -30,9 +30,9 @@ Built for Atlassian Codegeist 2026 (Apps for Software Teams). Runs on Atlassian:
 
 ## Install
 
-<!-- INSTALL_LINK: paste the same Developer Console installation link used on Devpost -->
+Installation link (Jira + Confluence): https://developer.atlassian.com/console/install/288617c9-b888-4d17-af01-241b9acfe722?signature=AYABeLcRTww9qQhK%2BaBZfVNsSIIAAAADAAdhd3Mta21zAEthcm46YXdzOmttczp1cy13ZXN0LTI6NzA5NTg3ODM1MjQzOmtleS83MDVlZDY3MC1mNTdjLTQxYjUtOWY5Yi1lM2YyZGNjMTQ2ZTcAuAECAQB4CxqLTo9l4lqXuFjNim1xJM%2Bp%2F3TVP9xHS2BrU5DRRucBtwk12%2B32MkPj4xXTOeVLHgAAAH4wfAYJKoZIhvcNAQcGoG8wbQIBADBoBgkqhkiG9w0BBwEwHgYJYIZIAWUDBAEuMBEEDG8H8c6Mrn25Vfp%2FbAIBEIA7EqCVgrb5i3A%2BFrnceDhu6GL2x8nI%2FGKgDkFFMGKnv0%2Fk6rYWG3TKP6gl4PrKSNKSdV5O0WRCF%2F8HjkYAB2F3cy1rbXMAS2Fybjphd3M6a21zOmV1LXdlc3QtMTo3MDk1ODc4MzUyNDM6a2V5LzQ2MzBjZTZiLTAwYzMtNGRlMi04NzdiLTYyN2UyMDYwZTVjYwC4AQICAHi9bVMAkme4qVQX1fQHo6ePw3H40A7cGfz7yrmSfBWMXgFabIFXUS5akYpcEorvbE4%2FAAAAfjB8BgkqhkiG9w0BBwagbzBtAgEAMGgGCSqGSIb3DQEHATAeBglghkgBZQMEAS4wEQQMcUFtx91kWJ3ZDhsvAgEQgDsQKeUIthQ%2BwLgGNHRvkyct8wyoN%2FMgwswYanj2BPJ1zZE33yHnLyUODPYyc8f2GugG4nzYvt6q%2F9Qf3QAHYXdzLWttcwBLYXJuOmF3czprbXM6dXMtZWFzdC0xOjcwOTU4NzgzNTI0MzprZXkvNmMxMjBiYTAtNGNkNS00OTg1LWI4MmUtNDBhMDQ5NTJjYzU3ALgBAgIAeDYASx0XCjkny4iLV6vz%2BKtEGSGT6kdt0QRpkn6D%2FlVEAT%2Bb4nWUytbS6wnbtJEo7N0AAAB%2BMHwGCSqGSIb3DQEHBqBvMG0CAQAwaAYJKoZIhvcNAQcBMB4GCWCGSAFlAwQBLjARBAxsR8HzOXNqFR2cfcECARCAO8Qhnsgd7uHWi%2FzbEoDkobzhPQM6485rWaBp0uWjqjHJOp80DlnZTIH%2FCb5uYSojeY7TSZ1%2FKum73XBYAgAAAAAMAAAQAAAAAAAAAAAAAAAAAHKH%2Fx8SJIi6MskrvU%2BYIFP%2F%2F%2F%2F%2FAAAAAQAAAAAAAAAAAAAAAQAAADIXZMFDu8Ntd0zNsK63pvRyLykkzEzjBtjiUP7Q6QpqVo3vOIaHuo0psPtRKcAQTGC6gqp9bQWhttRWm0oVZ59wyhI%3D&product=jira&product=confluence
 
-Install Hindsight from its Atlassian Marketplace listing, or use the installation link listed in the Codegeist 2026 submission on Devpost. Install it on **Jira** first, then on **Confluence** on the same site (this order also avoids the MCP `-32014` error described below). An organization admin approves the requested scopes during install.
+Use the installation link above (the same link is listed in the Codegeist 2026 submission on Devpost). Install it on **Jira** first, then on **Confluence** on the same site (this order also avoids the MCP `-32014` error described below). An organization admin approves the requested scopes during install.
 
 ## Setup
 
@@ -75,7 +75,7 @@ Notes: don't click **Analyze again** after confirming, because AI scoring can su
 Requires an organization admin and Rovo enabled on the site.
 
 1. In `admin.atlassian.com`, open your organization → **Connectors** → **All connectors** → **Add connector**.
-2. Choose the category **Other**, select **Hindsight**, enter a name and click **Connect**.
+2. Choose the category **Other**, select **Hindsight signals**, enter a name and click **Connect**.
 3. The setup page shows "Connector: connected". After the next analysis, the dossier "Early signals for <incident key>" appears in Rovo Search (full search page, filter "All apps").
 
 Dossiers are visible to everyone in the organization only for the demo incident, or for all incidents if the setting `dossier_all_incidents` is true (default false). Without a connector, Hindsight still reads Teamwork Graph and writes nothing to it.
