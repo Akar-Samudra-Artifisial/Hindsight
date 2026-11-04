@@ -142,6 +142,7 @@ Hindsight is provided by Bayu Trisnapati.
 
 - Support portal: https://bayutrisnapati.atlassian.net/servicedesk/customer/portals
 - Email: bayutrisnapati@gmail.com
+- Security: report vulnerabilities privately as described in the [Security Policy](SECURITY.md)
 
 ## License
 

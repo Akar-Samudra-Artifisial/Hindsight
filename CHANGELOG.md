@@ -13,6 +13,7 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), dan p
 
 ### Added
 
+- Kebijakan keamanan `SECURITY.md` untuk listing Marketplace: cara melapor kerentanan (portal dukungan/email), target respons selaras Atlassian Marketplace Security Bug Fix Policy, dan ringkasan desain keamanan (Runs on Atlassian).
 - Kebijakan privasi `docs/PRIVACY.md` untuk listing Marketplace dan Developer Console.
 - Ketentuan layanan `docs/TERMS.md`.
 - Lisensi MIT (`LICENSE`).
