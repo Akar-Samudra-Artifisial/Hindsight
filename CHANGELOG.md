@@ -17,6 +17,7 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), dan p
 
 ### Added
 
+- `manifest.yml`: agen Rovo "Hindsight Investigator" memakai ikon Hindsight (`icon: resource:icons;hindsight.svg`), menggantikan avatar generik di chat Rovo.
 - Kebijakan keamanan `SECURITY.md` untuk listing Marketplace: cara melapor kerentanan (portal dukungan/email), target respons selaras Atlassian Marketplace Security Bug Fix Policy, dan ringkasan desain keamanan (Runs on Atlassian).
 - Kebijakan privasi `docs/PRIVACY.md` untuk listing Marketplace dan Developer Console.
 - Ketentuan layanan `docs/TERMS.md`.

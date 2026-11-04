@@ -86,6 +86,7 @@ modules:
   rovo:agent:
     - key: hindsight-investigator
       name: Hindsight Investigator
+      icon: resource:icons;hindsight.svg
       description: Looks back at a past incident, finds the early signals that already
         pointed to it, shows where they stopped and proposes routes so they
         reach the right team next time.
