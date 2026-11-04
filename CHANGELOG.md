@@ -9,7 +9,11 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), dan p
 ### Changed
 
 - `docs/PRIVACY.md` dan `docs/TERMS.md`: pihak penyedia disamakan menjadi Bayu Trisnapati (vendor Marketplace perorangan; kode dipublikasikan di GitHub Akar Samudra Artifisial), ditambah portal dukungan; substansi kebijakan data tidak berubah.
-- `README.md` dilengkapi untuk customer dan reviewer Marketplace: instalasi dari listing, alur pemakaian, bagian Data and privacy (Runs on Atlassian, Forge SQL, Forge LLM), dan Support (portal + email).
+- `docs/TERMS.md`: app lewat installation link Codegeist gratis; versi Marketplace terpisah (bila ada) dikenai harga sesuai listing dan Atlassian Marketplace terms. Tambah tanggal "Last updated" 4 Nov 2026.
+- `docs/PRIVACY.md`: daftar data tersimpan dilengkapi sesuai skema Forge SQL (ringkasan, severity, dan tim responder insiden; judul, label, dan component artefak; judul artefak dan nama tim target alert; account ID pemutus rute dan peminta analisis untuk audit).
+- `README.md`: nama connector Teamwork Graph disamakan dengan manifest ("Hindsight signals").
+- `README.md`: instalasi hanya lewat installation link (klaim pemasangan dari listing Marketplace dihapus karena listing belum terbit).
+- `README.md` dilengkapi untuk customer dan reviewer Marketplace: alur pemakaian, bagian Data and privacy (Runs on Atlassian, Forge SQL, Forge LLM), dan Support (portal + email).
 
 ### Added
 

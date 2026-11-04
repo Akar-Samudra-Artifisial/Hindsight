@@ -30,18 +30,18 @@ Only projects and spaces listed in the service mappings on the Hindsight setup p
 
 Data the app persists is kept in Atlassian-hosted Forge SQL, separate for each installation. Hindsight stores references and short excerpts, not full copies of your content:
 
-- **Incidents:** issue key, affected service and time window of the analysis.
-- **Events:** type, time, a reference to the source artifact, a hash of its text (not the text itself), and the Atlassian account ID of the author (used only to compute reach).
+- **Incidents:** issue key and project, the incident summary (its title), severity, affected service, start and resolution time, the responder team (team ID and team name), and the keywords used to search for signals.
+- **Events:** for each work item, request, comment or page in scope: type, time, a reference and link to the source artifact, its title, project or space, component names and labels, workflow status and resolution, a hash and the length of its text (not the text itself), and the Atlassian account ID of the author (used only to compute reach).
 - **Signal candidates:** a reference to an event, a filter score, the reason it passed filtering, and an excerpt of the artifact text of at most 2,000 characters, which is what the AI model reads.
 - **Signals:** a verbatim quote of at most 300 characters taken from the excerpt, signal type, confidence, a short reason (account IDs, emails and @mentions are removed), status (proposed, confirmed, rejected) and the number of days before the incident.
 - **Decisions:** confirm, reject and undo decisions on signals and route approvals, with time and the Atlassian account ID of the person who decided. This ID is kept for audit only and is never shown in the app, sent to Rovo or exposed over MCP.
 - **Reach paths:** for each confirmed signal, the teams and roles that touched it, the number of steps and where it stopped. No account IDs are stored here.
-- **Routes:** source (space, project, component or label), keywords, target team, estimated days saved, status and the originating incident. Routes become active only after a person approves them.
-- **Alerts:** for each Sentinel match, the route, a reference to the artifact, the matched keywords, status and optional "Useful / Not useful" feedback. No account IDs are stored here.
-- **Score cache:** for the demo incident only, the AI verdict per artifact, so that re-running the demo gives the same result.
-- **Configuration and job status:** service mappings, owner team IDs, settings, the Teamwork Graph connection ID, analysis progress (counts, errors, model and prompt version) and records of demo artifacts created by the app. These contain no artifact content.
+- **Routes:** source (space, project, component or label), keywords, target team, estimated days saved, status, the originating incident, and the Atlassian account ID of the person who approved or dismissed the route (audit only, never shown in the app, sent to Rovo or exposed over MCP). Routes become active only after a person approves them.
+- **Alerts:** for each Sentinel match, the route, a reference, link and title of the artifact, the matched keywords, the target team (team ID and team name), the ID of the posted comment, status and optional "Useful / Not useful" feedback. No account IDs are stored here.
+- **Score cache:** for the demo incident only, the AI verdict per artifact (including the quote and short reason), so that re-running the demo gives the same result.
+- **Configuration and job status:** service mappings (projects, components, spaces, aliases, owner team ID and team name), settings, the Teamwork Graph connection ID and name, analysis progress (counts, errors, model and prompt version, and the Atlassian account ID of the person who started the analysis), and records of demo artifacts created by the app. These contain no artifact content.
 
-The app does not store names or email addresses. Names are shown only when Atlassian returns them to a user who can already see the original artifact.
+The app does not store names or email addresses of people; it stores team names only. Names are shown only when Atlassian returns them to a user who can already see the original artifact.
 
 ## Retention
 

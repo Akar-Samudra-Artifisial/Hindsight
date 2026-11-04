@@ -1,8 +1,9 @@
 # Hindsight Terms of Service
 
 Effective date: 3 November 2026
+Last updated: 4 November 2026
 
-1. Hindsight is a free, non-commercial Atlassian Forge app for Jira Service Management, Jira and Confluence, provided by Bayu Trisnapati (individual Marketplace vendor, publishing the source as part of Akar Samudra Artifisial on GitHub; "the developer") as an entry to Atlassian Codegeist 2026. It is in early development.
+1. Hindsight is an Atlassian Forge app for Jira Service Management, Jira and Confluence, provided by Bayu Trisnapati (individual Marketplace vendor, publishing the source as part of Akar Samudra Artifisial on GitHub; "the developer") as an entry to Atlassian Codegeist 2026. It is in early development. The app installed through the installation link published with the Codegeist 2026 submission is free of charge. A separate version of the app may be offered on the Atlassian Marketplace; if so, that version is charged at the prices shown on its Marketplace listing, and its purchase and licensing are also governed by the Atlassian Marketplace terms.
 2. The source code is licensed under the MIT License (see `LICENSE`). These terms cover use of the installed app.
 3. The app is provided "as is", without warranty of any kind, express or implied. There is no service level agreement, uptime commitment or guaranteed support.
 4. Hindsight uses AI (Forge LLM) to propose early signals, routes and briefings. AI output can be wrong or incomplete. Proposed signals, routes and estimated time savings must be reviewed and confirmed by people before you act on them. The app does not replace your team's judgement or your post-incident review process.
