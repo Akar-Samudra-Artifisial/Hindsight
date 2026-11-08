@@ -63,7 +63,7 @@ The demo is a fictional company, Arkana Commerce.
 2. In Atlassian Teams, create **Arkana Platform**, **Arkana Support** and **Arkana Payments**. Stay a member of Platform and Support; leave Payments (it can have no members).
 3. In **Service mapping**, edit `checkout`, paste the team id of **Arkana Payments** as owner team, and save.
 4. Click **Stamp demo data**. It adds a "Reviewed by" note to a demo page and makes you a watcher of a few demo work items, so the demo has human touches in Teamwork Graph.
-5. Open the incident **"Checkout payments failing"** in `INC`, open the **Hindsight** panel and click **Analyze** once (about 20 seconds). Expected: 48 scanned → 47 in the 30-day window → 5 candidates → 4 signals.
+5. Open the incident **"Checkout payments failing"** in `INC`, open the **Hindsight** panel and click **Analyze** once (about 20 seconds). Expected: about 50 artifacts scanned → 5 candidates → 4 signals (the exact scan count varies slightly by site).
 6. **Confirm** all four signals, then click **Trace reach**. Expected: first signal 12 d, awareness gap 12 d, reach 0/4, each signal "Stopped at Arkana Platform · 1 missing link to Arkana Payments".
 7. Open **Routes**: Confluence space PLAT (~11 days earlier, up to 12), Jira project INC (~5), Jira project PAY (~3). Click **Approve** on the PLAT route; it becomes Active.
 8. Back in setup, click **Post a new provider notice** (needs the Active PLAT route). The Sentinel alert appears within a few minutes, once Confluence search has indexed the notice. Open the Platform page in Confluence to see "[Hindsight Sentinel] Heads-up for Arkana Payments"; the **Routes** tab shows "1 alert posted".

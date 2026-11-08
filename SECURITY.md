@@ -56,8 +56,7 @@ Severity is assessed with CVSS. You will be kept informed of progress and told w
 - **Permission checks.** Quotes, titles and links are shown only to users who can open the source artifact, verified with `asUser` calls. Rovo actions and MCP tools apply the same checks.
 - **Least-privilege scopes.** Each scope in `manifest.yml` is documented with the reason it is needed. Adding a scope requires a major version that site admins must approve.
 - **No stored secrets.** Hindsight stores no API tokens, passwords or credentials; authentication is handled by the Forge platform.
-- **Dependency scanning.** Dependencies are pinned through `package-lock.json` and checked with `npm audit` before releases.
-- **Maintainer account security.** Multi-factor authentication is enabled on the maintainer's Atlassian, GitHub and email accounts. Development machines use full-disk encryption, and backups are encrypted.
+- **Pinned dependencies.** Dependency versions are locked through `package-lock.json`. On 8 Nov 2026, `npm audit --omit=dev` reported no high or critical vulnerabilities in production dependencies.
 
 ## Related documents
 

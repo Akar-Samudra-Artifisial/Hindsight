@@ -6,6 +6,10 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), dan p
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-08
+
+Rilis submisi Codegeist 2026. Dideploy sebagai Forge production 2.8.0 (development 4.21.0).
+
 ### Changed
 
 - `docs/PRIVACY.md` dan `docs/TERMS.md`: pihak penyedia disamakan menjadi Bayu Trisnapati (vendor Marketplace perorangan; kode dipublikasikan di GitHub Akar Samudra Artifisial), ditambah portal dukungan; substansi kebijakan data tidak berubah.

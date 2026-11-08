@@ -1,6 +1,6 @@
 {
   "name": "hindsight",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "Hindsight finds the early signals before an incident, shows where they stopped, and routes similar signals to the right team next time",
   "license": "MIT",
