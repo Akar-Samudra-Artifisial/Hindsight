@@ -6,6 +6,11 @@ Format mengikuti [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), dan p
 
 ## [Unreleased]
 
+### Changed
+
+- `README.md` diperbarui untuk juri dan pengguna: tagline, badge (Forge, Runs on Atlassian, MIT, Codegeist 2026), thumbnail video demo, bagian The problem (contoh checkout: sinyal 12 hari lebih awal, reach 0/4), tabel fitur, galeri 8 gambar, arsitektur + daftar modul Forge, status Marketplace (submitted for review), dan daftar dokumen. Link instalasi tidak berubah.
+- Galeri README: 8 screenshot (lebar 1600 px) disalin ke `docs/images/`.
+
 ## [1.0.0] - 2026-11-08
 
 Rilis submisi Codegeist 2026. Dideploy sebagai Forge production 2.8.0 (development 4.21.0).
